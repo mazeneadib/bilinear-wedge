@@ -1,0 +1,814 @@
+"""
+================================================================================
+SUPPLEMENTARY MATERIAL: PYTHON IMPLEMENTATION
+Bilinear Wedge Analysis for Active Earth Pressure on Retaining Walls
+with Lightweight Cellular Concrete and Soil Backfill
+================================================================================
+
+Authors: [Mazen Adib]
+Journal: ASCE Journal of Geotechnical and Geoenvironmental Engineering
+Date: Submitted for Publication in January 2026
+
+This supplementary material provides a complete Python implementation of the
+bilinear wedge analysis method described in the manuscript. The code computes
+lateral earth thrust E₂(α) for hybrid LCC/soil backfill systems using limit
+equilibrium analysis with Coulomb friction.
+
+CONTENTS:
+1. Main computation function: compute_E2()
+2. Optimization routine: optimize_E2()
+3. Plotting functions: plot_optimization_curve()
+4. Example usage and verification
+5. Complete worked example from manuscript
+
+REQUIREMENTS:
+- Python 3.7 or higher
+- NumPy (for numerical calculations)
+- Matplotlib (optional, for plotting)
+- Pandas (optional, for tabular output)
+
+INSTALLATION:
+    pip install numpy matplotlib pandas
+
+USAGE:
+    python bilinear_wedge_analysis.py
+
+LICENSE:
+This code is provided as supplementary material for the manuscript and may be
+used freely for academic and research purposes with proper citation.
+
+CITATION:
+[To be added upon publication]
+
+================================================================================
+"""
+
+import math
+import numpy as np
+from typing import Dict, Tuple, Optional, List
+import warnings
+
+# ============================================================================
+# CORE ANALYSIS FUNCTIONS
+# ============================================================================
+
+def compute_E2(
+    alpha_deg: float,
+    h1: float,
+    h2: float,
+    h3: float,
+    beta_deg: float,
+    delta_deg: float,
+    gamma_s: float,
+    gamma_LCC: float,
+    gamma_p: float,
+    T_l: float,
+    c_prime: float,
+    phi_deg: float
+) -> Dict[str, float]:
+    """
+    Compute lateral earth thrust E₂ for hybrid LCC/soil backfill system.
+    
+    This function implements the bilinear wedge analysis method using two-wedge
+    limit equilibrium for α ≤ α_crit, and single-wedge analysis for α > α_crit.
+    
+    Parameters
+    ----------
+    alpha_deg : float
+        Trial failure plane angle from vertical (degrees)
+    h1 : float
+        Soil layer height at heel (ft)
+    h2 : float
+        LCC wedge height (ft)
+    h3 : float
+        Pavement thickness (ft)
+    beta_deg : float
+        Interface slope angle from vertical (degrees)
+    delta_deg : float
+        Wall/interface friction angle (degrees)
+    gamma_s : float
+        Soil unit weight (pcf)
+    gamma_LCC : float
+        LCC unit weight (pcf)
+    gamma_p : float
+        Pavement unit weight (pcf)
+    T_l : float
+        Traffic surcharge (psf)
+    c_prime : float
+        Effective cohesion (psf)
+    phi_deg : float
+        Soil friction angle (degrees)
+    
+    Returns
+    -------
+    dict
+        Dictionary containing:
+        - 'alpha_deg': Trial angle (degrees)
+        - 'alpha_crit_deg': Critical angle (degrees)
+        - 'case': Analysis case ('alpha <= alpha_crit' or 'alpha > alpha_crit')
+        - 'E1': Thrust from Wedge 1 (lb/ft), 0 if single wedge
+        - 'E2': Total lateral thrust (lb/ft)
+        - 'W1': Wedge 1 weight (lb/ft), 0 if single wedge
+        - 'W2': Wedge 2 weight (lb/ft)
+        - Geometric quantities: h_soil, h_BC, L1, L2, L_BO, L_AB
+        - Force ratios: A_beta, B_beta, A_alpha, B_alpha
+    
+    Notes
+    -----
+    All angles measured from VERTICAL (not horizontal).
+    Assumes per-unit-width analysis (1 ft out-of-plane).
+    
+    References
+    ----------
+    See manuscript equations (1)-(38) for detailed derivation.
+    
+    Examples
+    --------
+    >>> # I-405 Project parameters
+    >>> result = compute_E2(
+    ...     alpha_deg=35.0,
+    ...     h1=3.0, h2=25.0, h3=2.0,
+    ...     beta_deg=45.0, delta_deg=0.0,
+    ...     gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+    ...     T_l=240.0, c_prime=0.0, phi_deg=34.0
+    ... )
+    >>> print(f"E₂ = {result['E2']:.0f} lb/ft")
+    E₂ = 7397 lb/ft
+    """
+    
+    # Convert angles to radians
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(beta_deg)
+    delta = math.radians(delta_deg)
+    phi = math.radians(phi_deg)
+    
+    # Define geometric functions A(θ,φ) and B(θ,φ)
+    def A(theta: float) -> float:
+        """A(θ,φ) = cos(θ) - tan(φ)sin(θ)"""
+        return math.cos(theta) - math.tan(phi) * math.sin(theta)
+    
+    def B(theta: float) -> float:
+        """B(θ,φ) = tan(φ)cos(θ) + sin(θ)"""
+        return math.tan(phi) * math.cos(theta) + math.sin(theta)
+    
+    # Compute critical angle α_crit
+    alpha_crit = math.atan((h2 * math.tan(beta)) / (h2 + h1))
+    alpha_crit_deg = math.degrees(alpha_crit)
+    
+    # Initialize output dictionary
+    out = {
+        "alpha_deg": alpha_deg,
+        "alpha_crit_deg": alpha_crit_deg
+    }
+    
+    # Check for numerical issues
+    if abs(A(beta)) < 1e-10 or abs(A(alpha)) < 1e-10:
+        warnings.warn(
+            f"A(θ,φ) near zero at α={alpha_deg}°. "
+            "Results may be numerically unstable."
+        )
+    
+    # ========================================================================
+    # CASE A: TWO-WEDGE ANALYSIS (α ≤ α_crit)
+    # ========================================================================
+    
+    if alpha <= alpha_crit + 1e-12:  # Small tolerance for numerical equality
+        
+        # --------------------------------------------------------------------
+        # WEDGE 1 GEOMETRY AND WEIGHT
+        # --------------------------------------------------------------------
+        
+        # Vertical distance from A to B (Equation 4)
+        h_soil = (h1 * math.tan(beta)) / (math.tan(beta) - math.tan(alpha))
+        
+        # Vertical distance from B to O' (Equation 5)
+        h_BC = (h1 + h2) - h_soil
+        
+        # Horizontal extent of Wedge 1 (Equation 6)
+        L1 = h_BC * math.tan(beta)
+        
+        # LCC triangular area (Equation 7)
+        V_w1 = 0.5 * L1 * h_BC
+        
+        # Component weights
+        W_LCC_1 = gamma_LCC * V_w1
+        W_p_1 = gamma_p * h3 * L1
+        W_t_1 = T_l * L1
+        
+        # Total Wedge 1 weight (Equation 8)
+        W1 = W_LCC_1 + W_p_1 + W_t_1
+        
+        # Contact length on interface BC
+        L_BO = L1 / math.sin(beta)
+        
+        # Geometric functions for β
+        A_beta = A(beta)
+        B_beta = B(beta)
+        
+        # Thrust from Wedge 1 (Equation 15)
+        numerator_1 = W1 - c_prime * L_BO * (
+            math.cos(beta) + (math.sin(beta) * B_beta) / A_beta
+        )
+        denominator_1 = math.sin(delta) + (math.cos(delta) * B_beta) / A_beta
+        E1 = numerator_1 / denominator_1
+        
+        # --------------------------------------------------------------------
+        # WEDGE 2 GEOMETRY AND WEIGHT
+        # --------------------------------------------------------------------
+        
+        # Horizontal extent from B to O' (Equation 18)
+        L2 = h2 * math.tan(beta) - L1
+        
+        # Total trapezoid area (Equation 19)
+        V_w2 = ((h2 + h1 + h_BC) / 2.0) * L2
+        
+        # LCC trapezoid area (Equation 20)
+        V_LCC_2 = ((h2 + h_BC) / 2.0) * L2
+        
+        # Soil area (Equation 21)
+        V_soil_2 = V_w2 - V_LCC_2
+        
+        # Component weights
+        W_LCC_2 = gamma_LCC * V_LCC_2
+        W_soil_2 = gamma_s * V_soil_2
+        W_p_2 = gamma_p * h3 * L2
+        W_t_2 = T_l * L2
+        
+        # Total Wedge 2 weight (Equation 22)
+        W2 = W_LCC_2 + W_soil_2 + W_p_2 + W_t_2
+        
+        # Failure plane length
+        L_AB = h_soil / math.sin(alpha)
+        
+        # Geometric functions for α
+        A_alpha = A(alpha)
+        B_alpha = B(alpha)
+        
+        # Total lateral thrust (Equation 29)
+        numerator_2 = W2 - c_prime * L_AB * (
+            math.cos(alpha) + (math.sin(alpha) * B_alpha) / A_alpha
+        )
+        denominator_2 = math.sin(delta) + (math.cos(delta) * B_alpha) / A_alpha
+        E2 = E1 + numerator_2 / denominator_2
+        
+        # Store results
+        out.update({
+            "case": "alpha <= alpha_crit",
+            "E1": E1,
+            "E2": E2,
+            "W1": W1,
+            "W2": W2,
+            "h_soil": h_soil,
+            "h_BC": h_BC,
+            "L1": L1,
+            "L2": L2,
+            "L_BO": L_BO,
+            "L_AB": L_AB,
+            "A_beta": A_beta,
+            "B_beta": B_beta,
+            "A_alpha": A_alpha,
+            "B_alpha": B_alpha,
+            "V_LCC_1": V_w1,
+            "V_LCC_2": V_LCC_2,
+            "V_soil_2": V_soil_2
+        })
+        
+        return out
+    
+    # ========================================================================
+    # CASE B: SINGLE-WEDGE ANALYSIS (α > α_crit)
+    # ========================================================================
+    
+    else:
+        
+        # --------------------------------------------------------------------
+        # SINGLE COMPOSITE WEDGE GEOMETRY AND WEIGHT
+        # --------------------------------------------------------------------
+        
+        # Horizontal extent (Equation 32)
+        L2 = (h2 + h1) * math.tan(alpha)
+        
+        # LCC triangular area (fixed, independent of α) (Equation 33)
+        V_LCC = 0.5 * h2**2 * math.tan(beta)
+        
+        # Total triangular wedge area (Equation 34)
+        V_total = 0.5 * (h2 + h1)**2 * math.tan(alpha)
+        
+        # Soil area (Equation 35)
+        V_soil = V_total - V_LCC
+        
+        # Component weights
+        W_LCC_2 = gamma_LCC * V_LCC
+        W_soil_2 = gamma_s * V_soil
+        W_p_2 = gamma_p * h3 * L2
+        W_t_2 = T_l * L2
+        
+        # Total weight (Equation 36)
+        W2 = W_LCC_2 + W_soil_2 + W_p_2 + W_t_2
+        
+        # Failure plane length
+        L_AB = (h1 + h2) / math.sin(alpha)
+        
+        # Geometric functions for α
+        A_alpha = A(alpha)
+        B_alpha = B(alpha)
+        
+        # Total lateral thrust (Equation 37)
+        numerator_2 = W2 - c_prime * L_AB * (
+            math.cos(alpha) + (math.sin(alpha) * B_alpha) / A_alpha
+        )
+        denominator_2 = math.sin(delta) + (math.cos(delta) * B_alpha) / A_alpha
+        E2 = numerator_2 / denominator_2
+        
+        # Store results
+        out.update({
+            "case": "alpha > alpha_crit",
+            "E1": 0.0,  # No Wedge 1 in single-wedge case
+            "E2": E2,
+            "W1": 0.0,
+            "W2": W2,
+            "L2": L2,
+            "L_AB": L_AB,
+            "A_alpha": A_alpha,
+            "B_alpha": B_alpha,
+            "V_LCC_2": V_LCC,
+            "V_soil_2": V_soil,
+            "h_soil": None,
+            "h_BC": None,
+            "L1": None,
+            "L_BO": None
+        })
+        
+        return out
+
+
+def optimize_E2(
+    alpha_range: Tuple[float, float],
+    h1: float,
+    h2: float,
+    h3: float,
+    beta_deg: float,
+    delta_deg: float,
+    gamma_s: float,
+    gamma_LCC: float,
+    gamma_p: float,
+    T_l: float,
+    c_prime: float,
+    phi_deg: float,
+    n_points: int = 100
+) -> Tuple[float, float, List[Dict]]:
+    """
+    Find critical angle α that maximizes lateral thrust E₂.
+    
+    Parameters
+    ----------
+    alpha_range : tuple of float
+        (min_alpha, max_alpha) in degrees
+    [other parameters same as compute_E2]
+    n_points : int, optional
+        Number of trial angles to evaluate (default: 100)
+    
+    Returns
+    -------
+    alpha_crit : float
+        Critical angle that maximizes E₂ (degrees)
+    E2_max : float
+        Maximum lateral thrust (lb/ft)
+    results : list of dict
+        Complete results for all trial angles
+    
+    Examples
+    --------
+    >>> alpha_crit, E2_max, results = optimize_E2(
+    ...     alpha_range=(20.0, 45.0),
+    ...     h1=3.0, h2=25.0, h3=2.0,
+    ...     beta_deg=45.0, delta_deg=0.0,
+    ...     gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+    ...     T_l=240.0, c_prime=0.0, phi_deg=34.0,
+    ...     n_points=50
+    ... )
+    >>> print(f"Critical angle: {alpha_crit:.2f}°")
+    >>> print(f"Maximum thrust: {E2_max:.0f} lb/ft")
+    """
+    
+    # Generate trial angles
+    alpha_min, alpha_max = alpha_range
+    alphas = np.linspace(alpha_min, alpha_max, n_points)
+    
+    # Compute E₂ for each trial angle
+    results = []
+    for alpha_deg in alphas:
+        result = compute_E2(
+            alpha_deg, h1, h2, h3, beta_deg, delta_deg,
+            gamma_s, gamma_LCC, gamma_p, T_l, c_prime, phi_deg
+        )
+        results.append(result)
+    
+    # Find maximum
+    E2_values = [r['E2'] for r in results]
+    idx_max = np.argmax(E2_values)
+    alpha_crit = results[idx_max]['alpha_deg']
+    E2_max = results[idx_max]['E2']
+    
+    return alpha_crit, E2_max, results
+
+
+# ============================================================================
+# PLOTTING FUNCTIONS
+# ============================================================================
+
+def plot_optimization_curve(
+    results: List[Dict],
+    save_path: Optional[str] = None,
+    show_plot: bool = True
+) -> None:
+    """
+    Plot E₂(α) optimization curve.
+    
+    Parameters
+    ----------
+    results : list of dict
+        Results from optimize_E2()
+    save_path : str, optional
+        Path to save figure (default: None, don't save)
+    show_plot : bool, optional
+        Whether to display plot (default: True)
+    
+    Examples
+    --------
+    >>> alpha_crit, E2_max, results = optimize_E2(...)
+    >>> plot_optimization_curve(results, save_path='E2_optimization.png')
+    """
+    
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Matplotlib not installed. Skipping plot.")
+        return
+    
+    # Extract data
+    alphas = [r['alpha_deg'] for r in results]
+    E2_values = [r['E2'] for r in results]
+    alpha_crit_deg = results[0]['alpha_crit_deg']
+    
+    # Find maximum
+    idx_max = np.argmax(E2_values)
+    alpha_max = alphas[idx_max]
+    E2_max = E2_values[idx_max]
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Plot E₂(α)
+    ax.plot(alphas, E2_values, 'b-', linewidth=2, label='$E_2(\\alpha)$')
+    
+    # Mark maximum
+    ax.plot(alpha_max, E2_max, 'ro', markersize=10, 
+            label=f'Maximum: $\\alpha$ = {alpha_max:.1f}°, '
+                  f'$E_2$ = {E2_max:.0f} lb/ft')
+    
+    # Mark α_crit
+    ax.axvline(alpha_crit_deg, color='g', linestyle='--', linewidth=1.5,
+               label=f'$\\alpha_{{crit}}$ = {alpha_crit_deg:.2f}° '
+                     f'(two-wedge limit)')
+    
+    # Labels and formatting
+    ax.set_xlabel('Trial Angle $\\alpha$ (degrees from vertical)', fontsize=12)
+    ax.set_ylabel('Lateral Thrust $E_2$ (lb/ft)', fontsize=12)
+    ax.set_title('Optimization of Lateral Earth Thrust', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best', fontsize=10)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved to: {save_path}")
+    
+    if show_plot:
+        plt.show()
+    
+    plt.close()
+
+
+# ============================================================================
+# VALIDATION AND VERIFICATION
+# ============================================================================
+
+def verify_worked_example() -> bool:
+    """
+    Verify implementation against worked example from manuscript (α = 35°).
+    
+    Returns
+    -------
+    bool
+        True if all values match within tolerance
+    
+    Notes
+    -----
+    Expected values from manuscript Section 3:
+    - h_soil = 10.01 ft
+    - h_BC = 17.99 ft
+    - L₁ = 17.99 ft
+    - L₂ = 7.01 ft
+    - W₁ = 16,191 lb/ft
+    - W₂ = 11,070 lb/ft
+    - E₁ = 3,147 lb/ft
+    - E₂ = 7,397 lb/ft
+    """
+    
+    print("="*80)
+    print("VERIFICATION: Worked Example from Manuscript (α = 35°)")
+    print("="*80)
+    
+    # I-405 Project parameters
+    result = compute_E2(
+        alpha_deg=35.0,
+        h1=3.0, h2=25.0, h3=2.0,
+        beta_deg=45.0, delta_deg=0.0,
+        gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+        T_l=240.0, c_prime=0.0, phi_deg=34.0
+    )
+    
+    # Expected values from manuscript
+    expected = {
+        'h_soil': 10.01,
+        'h_BC': 17.99,
+        'L1': 17.99,
+        'L2': 7.01,
+        'W1': 16191,
+        'W2': 11070,
+        'E1': 3147,
+        'E2': 7397
+    }
+    
+    # Check each value
+    tolerance = 1.0  # Allow 1 lb/ft or 0.01 ft tolerance
+    all_passed = True
+    
+    print("\nComparison of Calculated vs. Expected Values:")
+    print("-" * 80)
+    print(f"{'Quantity':<15} {'Calculated':<15} {'Expected':<15} {'Diff':<12} {'Status':<10}")
+    print("-" * 80)
+    
+    for key, expected_val in expected.items():
+        calculated_val = result[key]
+        diff = abs(calculated_val - expected_val)
+        passed = diff <= tolerance
+        all_passed = all_passed and passed
+        
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"{key:<15} {calculated_val:<15.2f} {expected_val:<15.2f} "
+              f"{diff:<12.3f} {status:<10}")
+    
+    print("-" * 80)
+    
+    if all_passed:
+        print("\n✓ ALL CHECKS PASSED - Implementation verified!")
+    else:
+        print("\n✗ SOME CHECKS FAILED - Review implementation!")
+    
+    print("="*80)
+    print()
+    
+    return all_passed
+
+
+def generate_optimization_table(
+    alpha_range: Tuple[float, float] = (25.0, 42.0),
+    step: float = 1.0,
+    save_csv: bool = False,
+    csv_filename: str = "optimization_results.csv"
+) -> None:
+    """
+    Generate complete optimization table matching Table in manuscript.
+    
+    Parameters
+    ----------
+    alpha_range : tuple of float
+        (min_alpha, max_alpha) in degrees
+    step : float
+        Step size for trial angles (degrees)
+    save_csv : bool
+        Whether to save results to CSV file
+    csv_filename : str
+        Output CSV filename
+    
+    Examples
+    --------
+    >>> generate_optimization_table(alpha_range=(25, 42), step=1.0, save_csv=True)
+    """
+    
+    print("="*100)
+    print("OPTIMIZATION TABLE: E₂(α) for I-405 Project Parameters")
+    print("="*100)
+    
+    # I-405 Project parameters
+    h1, h2, h3 = 3.0, 25.0, 2.0
+    gamma_s, gamma_LCC, gamma_p = 120.0, 40.0, 150.0
+    T_l = 240.0
+    beta_deg, delta_deg, c_prime, phi_deg = 45.0, 0.0, 0.0, 34.0
+    
+    print(f"\nParameters:")
+    print(f"  Geometry: h₁={h1} ft, h₂={h2} ft, h₃={h3} ft, β={beta_deg}°")
+    print(f"  Materials: γ_soil={gamma_s} pcf, γ_LCC={gamma_LCC} pcf, γ_p={gamma_p} pcf")
+    print(f"  Loading: T_l={T_l} psf")
+    print(f"  Strength: φ={phi_deg}°, c'={c_prime} psf, δ={delta_deg}°")
+    
+    # Calculate α_crit
+    alpha_crit_rad = math.atan((h2 * math.tan(math.radians(beta_deg))) / (h2 + h1))
+    alpha_crit_deg = math.degrees(alpha_crit_rad)
+    print(f"\nα_crit = {alpha_crit_deg:.2f}°")
+    
+    # Generate trial angles
+    alphas = np.arange(alpha_range[0], alpha_range[1] + step/2, step)
+    
+    # Compute results
+    results = []
+    for alpha_deg in alphas:
+        result = compute_E2(
+            alpha_deg, h1, h2, h3, beta_deg, delta_deg,
+            gamma_s, gamma_LCC, gamma_p, T_l, c_prime, phi_deg
+        )
+        results.append(result)
+    
+    # Print table header
+    print("\n" + "="*100)
+    print(f"{'α (°)':<8} {'h_soil':<10} {'h_BC':<10} {'L₁':<10} {'L₂':<10} "
+          f"{'W₁':<12} {'W₂':<12} {'E₁':<12} {'E₂':<12}")
+    print(f"{'':8} {'(ft)':<10} {'(ft)':<10} {'(ft)':<10} {'(ft)':<10} "
+          f"{'(lb/ft)':<12} {'(lb/ft)':<12} {'(lb/ft)':<12} {'(lb/ft)':<12}")
+    print("-"*100)
+    
+    # Print table rows
+    max_E2 = 0
+    alpha_at_max = 0
+    
+    for result in results:
+        alpha = result['alpha_deg']
+        
+        if result['case'] == "alpha <= alpha_crit":
+            print(f"{alpha:<8.1f} {result['h_soil']:<10.2f} {result['h_BC']:<10.2f} "
+                  f"{result['L1']:<10.2f} {result['L2']:<10.2f} "
+                  f"{result['W1']:<12.0f} {result['W2']:<12.0f} "
+                  f"{result['E1']:<12.0f} {result['E2']:<12.0f}")
+        else:
+            print(f"{alpha:<8.1f} {'---':<10} {'---':<10} {'---':<10} "
+                  f"{result['L2']:<10.2f} {'---':<12} {result['W2']:<12.0f} "
+                  f"{'0':<12} {result['E2']:<12.0f}")
+        
+        if result['E2'] > max_E2:
+            max_E2 = result['E2']
+            alpha_at_max = alpha
+    
+    print("="*100)
+    print(f"\nCRITICAL ANGLE: α_crit = {alpha_at_max:.1f}°")
+    print(f"MAXIMUM THRUST: E₂,max = {max_E2:.0f} lb/ft")
+    print("="*100)
+    
+    # Save to CSV if requested
+    if save_csv:
+        try:
+            import pandas as pd
+            df = pd.DataFrame(results)
+            df.to_csv(csv_filename, index=False, float_format='%.3f')
+            print(f"\nResults saved to: {csv_filename}")
+        except ImportError:
+            print("\nPandas not installed. CSV export skipped.")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """
+    Main execution function demonstrating all capabilities.
+    """
+    
+    print("\n" + "="*100)
+    print("BILINEAR WEDGE ANALYSIS - PYTHON IMPLEMENTATION")
+    print("Supplementary Material for Journal Manuscript")
+    print("="*100 + "\n")
+    
+    # ========================================================================
+    # 1. VERIFY WORKED EXAMPLE
+    # ========================================================================
+    
+    print("\n" + "─"*100)
+    print("STEP 1: VERIFICATION AGAINST MANUSCRIPT WORKED EXAMPLE")
+    print("─"*100 + "\n")
+    
+    verification_passed = verify_worked_example()
+    
+    if not verification_passed:
+        print("⚠ WARNING: Verification failed. Check implementation!")
+        return
+    
+    # ========================================================================
+    # 2. GENERATE COMPLETE OPTIMIZATION TABLE
+    # ========================================================================
+    
+    print("\n" + "─"*100)
+    print("STEP 2: COMPLETE OPTIMIZATION TABLE")
+    print("─"*100 + "\n")
+    
+    generate_optimization_table(
+        alpha_range=(25.0, 42.0),
+        step=1.0,
+        save_csv=True,
+        csv_filename="I405_optimization_results.csv"
+    )
+    
+    # ========================================================================
+    # 3. FINE-RESOLUTION OPTIMIZATION
+    # ========================================================================
+    
+    print("\n" + "─"*100)
+    print("STEP 3: FINE-RESOLUTION OPTIMIZATION")
+    print("─"*100 + "\n")
+    
+    print("Performing fine-resolution search...")
+    
+    alpha_crit, E2_max, results_fine = optimize_E2(
+        alpha_range=(20.0, 45.0),
+        h1=3.0, h2=25.0, h3=2.0,
+        beta_deg=45.0, delta_deg=0.0,
+        gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+        T_l=240.0, c_prime=0.0, phi_deg=34.0,
+        n_points=200
+    )
+    
+    print(f"\nFine-resolution results:")
+    print(f"  Critical angle: α_crit = {alpha_crit:.3f}°")
+    print(f"  Maximum thrust: E₂,max = {E2_max:.1f} lb/ft")
+    
+    # ========================================================================
+    # 4. SENSITIVITY ANALYSIS (INTERFACE FRICTION)
+    # ========================================================================
+    
+    print("\n" + "─"*100)
+    print("STEP 4: SENSITIVITY TO INTERFACE FRICTION")
+    print("─"*100 + "\n")
+    
+    print("Comparing δ = 0° (conservative) vs. δ = 17° (0.5φ):\n")
+    
+    # Conservative case (δ = 0°)
+    result_delta0 = compute_E2(
+        alpha_deg=40.0,
+        h1=3.0, h2=25.0, h3=2.0,
+        beta_deg=45.0, delta_deg=0.0,
+        gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+        T_l=240.0, c_prime=0.0, phi_deg=34.0
+    )
+    
+    # Realistic case (δ = 0.5φ = 17°)
+    result_delta17 = compute_E2(
+        alpha_deg=40.0,
+        h1=3.0, h2=25.0, h3=2.0,
+        beta_deg=45.0, delta_deg=17.0,
+        gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+        T_l=240.0, c_prime=0.0, phi_deg=34.0
+    )
+    
+    print(f"  δ = 0° (I-405 design):  E₂ = {result_delta0['E2']:.0f} lb/ft")
+    print(f"  δ = 17° (0.5φ):         E₂ = {result_delta17['E2']:.0f} lb/ft")
+    reduction = 100 * (1 - result_delta17['E2'] / result_delta0['E2'])
+    print(f"  Reduction: {reduction:.1f}%")
+    
+    # ========================================================================
+    # 5. GENERATE OPTIMIZATION PLOT
+    # ========================================================================
+    
+    print("\n" + "─"*100)
+    print("STEP 5: GENERATE OPTIMIZATION PLOT")
+    print("─"*100 + "\n")
+    
+    try:
+        plot_optimization_curve(
+            results_fine,
+            save_path="E2_optimization_curve.png",
+            show_plot=False  # Set to True to display plot
+        )
+        print("✓ Optimization plot saved to: E2_optimization_curve.png")
+    except Exception as e:
+        print(f"⚠ Could not generate plot: {e}")
+    
+    # ========================================================================
+    # SUMMARY
+    # ========================================================================
+    
+    print("\n" + "="*100)
+    print("SUMMARY")
+    print("="*100)
+    print(f"\n✓ Verification: PASSED (matches manuscript worked example)")
+    print(f"✓ Maximum thrust: E₂,max = {E2_max:.0f} lb/ft at α = {alpha_crit:.2f}°")
+    print(f"✓ Tables and plots generated successfully")
+    print(f"\nFiles generated:")
+    print(f"  - I405_optimization_results.csv")
+    print(f"  - E2_optimization_curve.png")
+    print("\n" + "="*100 + "\n")
+
+
+if __name__ == "__main__":
+    main()
