@@ -1,0 +1,437 @@
+"""
+================================================================================
+SUPPLEMENTARY MATERIAL: PYTHON IMPLEMENTATION
+Bilinear Wedge Analysis for Active Earth Pressure on Retaining Walls
+with Lightweight Cellular Concrete and Soil Backfill
+complete with static and pseudo-static seismic analysis
+================================================================================
+
+Authors: [Mazen Adib]
+Journal: ASCE Journal of Geotechnical and Geoenvironmental Engineering
+Date: Submitted for Publication in January 2026
+
+
+"""
+E2 Static & Pseudo-Static Workflow (Vertical-Angle Convention) — v2
+-------------------------------------------------------------------
+Features:
+  1) Professional, step-by-step explanation of the workflow.
+  2) Robust CLI / interactive inputs with validation and help text.
+  3) Three plots:
+       (a) Static: E2 vs. α
+       (b) Pseudo-static: E2_ps vs. α
+       (c) Overlay: both curves
+     Each plot shows the input parameters and a vertical line at α_crit.
+  4) CSV export for both curves with α increasing by 1°.
+
+Angles (α, β, δ) are measured from VERTICAL.
+Per-unit-width analysis (1 ft out-of-plane).
+
+Examples:
+  python E2_workflow_v2.py --use-defaults
+  python E2_workflow_v2.py --h1 3 --h2 25 --h3 2 --beta 45 --delta 0 \
+      --gamma_s 120 --gamma_LCC 40 --gamma_p 150 --T_l 0 --c_prime 0 --phi 34 --k_h 0.16 \
+      --alpha_min 20 --alpha_max 60 --alpha_step 1 --output-prefix I405
+"""
+import math
+import argparse
+from dataclasses import dataclass
+from typing import List, Dict
+import numpy as np
+import matplotlib.pyplot as plt
+import csv
+
+
+@dataclass
+class Inputs:
+    h1: float
+    h2: float
+    h3: float
+    beta_deg: float
+    delta_deg: float
+    gamma_s: float
+    gamma_LCC: float
+    gamma_p: float
+    T_l: float
+    c_prime: float
+    phi_deg: float
+    k_h: float
+    alpha_min: float
+    alpha_max: float
+    alpha_step: float
+    output_prefix: str
+
+
+# Coulomb helpers
+def A(theta: float, phi: float) -> float:
+    return math.cos(theta) - math.tan(phi) * math.sin(theta)
+
+
+def B(theta: float, phi: float) -> float:
+    return math.sin(theta) + math.tan(phi) * math.cos(theta)
+
+
+# Geometry & weights
+def geometry_and_weights(alpha_deg: float, ip: Inputs) -> Dict:
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(ip.beta_deg)
+
+    alpha_crit = math.atan((ip.h2 * math.tan(beta)) / (ip.h2 + ip.h1))
+    alpha_crit_deg = math.degrees(alpha_crit)
+    out = {"alpha_deg": alpha_deg, "alpha_crit_deg": alpha_crit_deg}
+
+    if alpha <= alpha_crit + 1e-12:
+        # Case A (Two-wedge)
+        h_soil = (ip.h1 * math.tan(beta)) / (math.tan(beta) - math.tan(alpha))
+        h_BC = (ip.h1 + ip.h2) - h_soil
+        L1 = h_BC * math.tan(beta)
+        L_BO = L1 / math.sin(beta)
+        L2 = ip.h2 * math.tan(beta) - L1
+        L_AB = h_soil / math.cos(alpha)
+
+        V_LCC_1 = 0.5 * L1 * h_BC
+        W_LCC_1 = ip.gamma_LCC * V_LCC_1
+        W_p_1   = ip.gamma_p * ip.h3 * L1
+        W_t_1   = ip.T_l * L1
+        W1_total = W_LCC_1 + W_p_1 + W_t_1
+        W1s      = W_LCC_1 + W_p_1  # excludes traffic
+
+        V_w2 = ((ip.h2 + ip.h1 + h_BC) / 2.0) * L2
+        V_LCC_2 = ((ip.h2 + h_BC) / 2.0) * L2
+        V_soil_2 = V_w2 - V_LCC_2
+        W_LCC_2 = ip.gamma_LCC * V_LCC_2
+        W_soil_2 = ip.gamma_s * V_soil_2
+        W_p_2   = ip.gamma_p * ip.h3 * L2
+        W_t_2   = ip.T_l * L2
+        W2_total = W_LCC_2 + W_soil_2 + W_p_2 + W_t_2
+        W2s      = W_LCC_2 + W_soil_2 + W_p_2
+
+        out.update({
+            "case": "A",
+            "h_soil": h_soil, "h_BC": h_BC,
+            "L1": L1, "L2": L2, "L_BO": L_BO, "L_AB": L_AB,
+            "W1_total": W1_total, "W2_total": W2_total,
+            "W1s": W1s, "W2s": W2s,
+        })
+    else:
+        # Case B (Single-wedge)
+        L2 = (ip.h2 + ip.h1) * math.tan(alpha)
+        L_AB = (ip.h1 + ip.h2) / math.cos(alpha)
+
+        # LCC triangular area is constant with respect to alpha
+        V_LCC = 0.5 * ip.h2**2 * math.tan(beta)
+        V_total = 0.5 * (ip.h2 + ip.h1)**2 * math.tan(alpha)
+        V_soil = V_total - V_LCC
+
+        W_LCC_2 = ip.gamma_LCC * V_LCC
+        W_soil_2 = ip.gamma_s * V_soil
+        W_p_2 = ip.gamma_p * ip.h3 * L2
+        W_t_2 = ip.T_l * L2
+        W2_total = W_LCC_2 + W_soil_2 + W_p_2 + W_t_2
+        W2s      = W_LCC_2 + W_soil_2 + W_p_2
+
+        out.update({
+            "case": "B",
+            "L2": L2, "L_AB": L_AB,
+            "W1_total": 0.0, "W2_total": W2_total,
+            "W1s": 0.0, "W2s": W2s,
+        })
+
+    return out
+
+
+# Single-interface thrust
+def thrust_single_interface(W_total: float, c_prime: float, L_plane: float,
+                            theta_rad: float, delta_rad: float, phi_rad: float,
+                            Hs: float = 0.0) -> float:
+    A_th = A(theta_rad, phi_rad)
+    B_th = B(theta_rad, phi_rad)
+    eps = 1e-10
+    if abs(A_th) < eps:
+        raise ValueError("A(θ,φ) ≈ 0 (θ+φ ≈ 90°). Adjust angles or φ.")
+    num = (
+        W_total
+        - c_prime * L_plane * (math.cos(theta_rad) + (math.sin(theta_rad) * B_th) / A_th)
+        + (B_th / A_th) * Hs
+    )
+    den = math.sin(delta_rad) + (math.cos(delta_rad) * B_th) / A_th
+    return num / den
+
+
+# E2 computations
+def compute_E2_static(alpha_deg: float, ip: Inputs) -> Dict:
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(ip.beta_deg)
+    delta = math.radians(ip.delta_deg)
+    phi = math.radians(ip.phi_deg)
+    g = geometry_and_weights(alpha_deg, ip)
+    out = {"alpha_deg": alpha_deg, "case": g["case"], "alpha_crit_deg": g["alpha_crit_deg"]}
+    if g["case"] == "A":
+        E1 = thrust_single_interface(g["W1_total"], ip.c_prime, g["L_BO"], beta, delta, phi, Hs=0.0)
+        E2c = thrust_single_interface(g["W2_total"], ip.c_prime, g["L_AB"], alpha, delta, phi, Hs=0.0)
+        out["E2_static"] = E1 + E2c
+    else:
+        out["E2_static"] = thrust_single_interface(g["W2_total"], ip.c_prime, g["L_AB"], alpha, delta, phi, Hs=0.0)
+    return out
+
+
+def compute_E2_pseudostatic(alpha_deg: float, ip: Inputs) -> Dict:
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(ip.beta_deg)
+    delta = math.radians(ip.delta_deg)
+    phi = math.radians(ip.phi_deg)
+    g = geometry_and_weights(alpha_deg, ip)
+    out = {"alpha_deg": alpha_deg, "case": g["case"], "alpha_crit_deg": g["alpha_crit_deg"]}
+    if g["case"] == "A":
+        H1s = ip.k_h * g["W1s"]
+        H2s = ip.k_h * g["W2s"]
+        E1ps = thrust_single_interface(g["W1_total"], ip.c_prime, g["L_BO"], beta, delta, phi, Hs=H1s)
+        E2ps_c = thrust_single_interface(g["W2_total"], ip.c_prime, g["L_AB"], alpha, delta, phi, Hs=H2s)
+        out["E2_ps"] = E1ps + E2ps_c
+    else:
+        H2s = ip.k_h * g["W2s"]
+        out["E2_ps"] = thrust_single_interface(g["W2_total"], ip.c_prime, g["L_AB"], alpha, delta, phi, Hs=H2s)
+    return out
+
+
+# Plots
+def params_text(ip: Inputs) -> str:
+    return (
+        f"h1={ip.h1} ft, h2={ip.h2} ft, h3={ip.h3} ft\n"
+        f"beta={ip.beta_deg}°, delta={ip.delta_deg}°, phi={ip.phi_deg}°\n"
+        f"gamma_s={ip.gamma_s} pcf, gamma_LCC={ip.gamma_LCC} pcf, gamma_p={ip.gamma_p} pcf\n"
+        f"T_l={ip.T_l} psf, c'={ip.c_prime} psf, k_h={ip.k_h}\n"
+        f"alpha range=({ip.alpha_min}°, {ip.alpha_max}°), step={ip.alpha_step}°"
+    )
+
+
+def plot_with_alpha_crit(ax, alpha_crit_deg: float):
+    ax.axvline(alpha_crit_deg, color='g', linestyle='--', linewidth=1.5,
+               label=f"$\\alpha_\\mathrm{{crit}}$ = {alpha_crit_deg:.2f}°")
+
+
+def plot_curves(alphas: np.ndarray, E_static: np.ndarray, E_ps: np.ndarray,
+                ip: Inputs, alpha_crit_deg: float, prefix: str = "E2"):
+    text = params_text(ip)
+
+    # (a) Static
+    fig1, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.plot(alphas, E_static, 'b-', lw=2, label='E2 static')
+    i1 = int(np.argmax(E_static))
+    ax1.plot(alphas[i1], E_static[i1], 'ro', ms=8,
+             label=f"Max: α={alphas[i1]:.2f}°, E2={E_static[i1]:.0f}")
+    plot_with_alpha_crit(ax1, alpha_crit_deg)
+    ax1.set_xlabel('Trial angle α (degrees from vertical)')
+    ax1.set_ylabel('Lateral thrust E₂ (lb/ft)')
+    ax1.set_title('Static E₂(α)')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='best')
+    ax1.text(0.02, 0.02, text, transform=ax1.transAxes, fontsize=9,
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
+    fig1.tight_layout()
+    fig1.savefig(f'{prefix}_static.png', dpi=300, bbox_inches='tight')
+
+    # (b) Pseudo-static
+    fig2, ax2 = plt.subplots(figsize=(10, 6))
+    ax2.plot(alphas, E_ps, 'r--', lw=2, label='E2 pseudo-static')
+    i2 = int(np.argmax(E_ps))
+    ax2.plot(alphas[i2], E_ps[i2], 'ko', ms=8,
+             label=f"Max: α={alphas[i2]:.2f}°, E2_ps={E_ps[i2]:.0f}")
+    plot_with_alpha_crit(ax2, alpha_crit_deg)
+    ax2.set_xlabel('Trial angle α (degrees from vertical)')
+    ax2.set_ylabel('Lateral thrust E₂_ps (lb/ft)')
+    ax2.set_title('Pseudo-static E₂_ps(α)')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='best')
+    ax2.text(0.02, 0.02, text, transform=ax2.transAxes, fontsize=9,
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
+    fig2.tight_layout()
+    fig2.savefig(f'{prefix}_pseudo_static.png', dpi=300, bbox_inches='tight')
+
+    # (c) Overlay
+    fig3, ax3 = plt.subplots(figsize=(10, 6))
+    ax3.plot(alphas, E_static, 'b-', lw=2, label='E2 static')
+    ax3.plot(alphas, E_ps, 'r--', lw=2, label='E2 pseudo-static')
+    plot_with_alpha_crit(ax3, alpha_crit_deg)
+    ax3.set_xlabel('Trial angle α (degrees from vertical)')
+    ax3.set_ylabel('Lateral thrust E₂ (lb/ft)')
+    ax3.set_title('E₂(α): Static vs Pseudo-static')
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc='best')
+    ax3.text(0.02, 0.02, text, transform=ax3.transAxes, fontsize=9,
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
+    fig3.tight_layout()
+    fig3.savefig(f'{prefix}_overlay.png', dpi=300, bbox_inches='tight')
+    plt.close('all')
+
+
+# CSV export
+def export_csv(alphas: np.ndarray, E_static: np.ndarray, E_ps: np.ndarray,
+               cases: List[str], alpha_crit_deg: float, prefix: str):
+    # Static
+    with open(f'{prefix}_static_curve.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['alpha_deg', 'case', 'E2_static', 'alpha_crit_deg'])
+        for a, c, e in zip(alphas, cases, E_static):
+            w.writerow([f"{a:.0f}", c, f"{e:.6f}", f"{alpha_crit_deg:.6f}"])
+    # Pseudo-static
+    with open(f'{prefix}_pseudostatic_curve.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['alpha_deg', 'case', 'E2_ps', 'alpha_crit_deg'])
+        for a, c, e in zip(alphas, cases, E_ps):
+            w.writerow([f"{a:.0f}", c, f"{e:.6f}", f"{alpha_crit_deg:.6f}"])
+
+
+# Workflow explanation
+def explain_workflow(ip: Inputs):
+    print("\nWORKFLOW OVERVIEW")
+    print("  Step 1 — Geometry & weights: compute h_soil, h_BC, L1, L2, L_BO, L_AB; per-unit-width weights.")
+    print("  Step 2 — Thrust equations: use Coulomb A(θ,φ), B(θ,φ) to evaluate E2 (static) and E2_ps (pseudo-static).")
+    print("  Step 3 — Scan α-range: evaluate curves E2(α) and E2_ps(α) at 1° increments, find maxima.")
+    print("  Step 4 — Plot: generate three figures with α_crit line and your input parameters annotated.")
+    print("  Step 5 — Save: write PNG plots and CSV files to the working directory.")
+
+
+# Input validation helpers
+def _range_check(name: str, val: float, lo: float, hi: float, inclusive_hi: bool = False):
+    if inclusive_hi:
+        ok = (lo <= val <= hi)
+    else:
+        ok = (lo <= val < hi)
+    if not ok:
+        raise argparse.ArgumentTypeError(f"{name} must be in [{lo}, {hi}{']' if inclusive_hi else ')'}; got {val}")
+    return val
+
+
+def angle_0_90(name: str):
+    def _f(x: str):
+        v = float(x)
+        return _range_check(name, v, 0.0, 90.0, inclusive_hi=False)
+    return _f
+
+
+def positive(name: str, allow_zero: bool = False):
+    def _f(x: str):
+        v = float(x)
+        if allow_zero:
+            if v < 0:
+                raise argparse.ArgumentTypeError(f"{name} must be ≥ 0; got {v}")
+        else:
+            if v <= 0:
+                raise argparse.ArgumentTypeError(f"{name} must be > 0; got {v}")
+        return v
+    return _f
+
+
+def get_inputs_from_user() -> Inputs:
+    p = argparse.ArgumentParser(description="E2 static & pseudo-static workflow (vertical-angle convention)")
+    p.add_argument('--h1', type=positive('h1', allow_zero=False), help='Soil height at heel (ft) > 0')
+    p.add_argument('--h2', type=positive('h2', allow_zero=False), help='LCC height (ft) > 0')
+    p.add_argument('--h3', type=positive('h3', allow_zero=True), help='Pavement thickness (ft) ≥ 0')
+    p.add_argument('--beta', dest='beta_deg', type=angle_0_90('beta'), help='Interface angle β from vertical (deg) in [0, 90)')
+    p.add_argument('--delta', dest='delta_deg', type=angle_0_90('delta'), help='Wall friction angle δ from vertical (deg) in [0, 90)')
+    p.add_argument('--gamma_s', type=positive('gamma_s', allow_zero=False), help='Soil unit weight (pcf) > 0')
+    p.add_argument('--gamma_LCC', type=positive('gamma_LCC', allow_zero=False), help='LCC unit weight (pcf) > 0')
+    p.add_argument('--gamma_p', type=positive('gamma_p', allow_zero=False), help='Pavement unit weight (pcf) > 0')
+    p.add_argument('--T_l', type=positive('T_l', allow_zero=True), help='Traffic surcharge (psf) ≥ 0')
+    p.add_argument('--c_prime', type=positive('c_prime', allow_zero=True), help="Effective cohesion c' (psf) ≥ 0")
+    p.add_argument('--phi', dest='phi_deg', type=angle_0_90('phi'), help='Soil friction angle φ (deg) in [0, 90)')
+    p.add_argument('--k_h', type=positive('k_h', allow_zero=True), help='Horizontal pseudo-static coefficient k_h ≥ 0')
+    p.add_argument('--alpha_min', type=angle_0_90('alpha_min'), help='Lower bound for α (deg) in [0, 90)')
+    p.add_argument('--alpha_max', type=angle_0_90('alpha_max'), help='Upper bound for α (deg) in [0, 90) and < 90 - φ')
+    p.add_argument('--alpha_step', type=positive('alpha_step', allow_zero=False), default=1.0,
+                   help='Step for α in degrees (recommended 1.0)')
+    p.add_argument('--output-prefix', type=str, default='E2', help='Prefix for output files (PNG/CSV)')
+    p.add_argument('--use-defaults', action='store_true', help='Use built-in defaults (I-405 style)')
+    args = p.parse_args()
+
+    if args.use_defaults:
+        return Inputs(
+            h1=3.0, h2=25.0, h3=2.0,
+            beta_deg=45.0, delta_deg=0.0,
+            gamma_s=120.0, gamma_LCC=40.0, gamma_p=150.0,
+            T_l=0.0, c_prime=0.0, phi_deg=34.0,
+            k_h=0.16, alpha_min=20.0, alpha_max=60.0, alpha_step=1.0,
+            output_prefix='I405'
+        )
+
+    # Interactive prompts for any missing args
+    def prompt(name, default=None, caster=float):
+        val = getattr(args, name, None)
+        if val is not None:
+            return val
+        s = input(f"Enter {name.replace('_',' ')}" + (f" [default {default}]" if default is not None else "") + ": ").strip()
+        if s == '' and default is not None:
+            return default
+        return caster(s)
+
+    ip = Inputs(
+        h1=args.h1 if args.h1 is not None else prompt('h1', 3.0),
+        h2=args.h2 if args.h2 is not None else prompt('h2', 25.0),
+        h3=args.h3 if args.h3 is not None else prompt('h3', 2.0),
+        beta_deg=args.beta_deg if args.beta_deg is not None else prompt('beta_deg', 45.0),
+        delta_deg=args.delta_deg if args.delta_deg is not None else prompt('delta_deg', 0.0),
+        gamma_s=args.gamma_s if args.gamma_s is not None else prompt('gamma_s', 120.0),
+        gamma_LCC=args.gamma_LCC if args.gamma_LCC is not None else prompt('gamma_LCC', 40.0),
+        gamma_p=args.gamma_p if args.gamma_p is not None else prompt('gamma_p', 150.0),
+        T_l=args.T_l if args.T_l is not None else prompt('T_l', 0.0),
+        c_prime=args.c_prime if args.c_prime is not None else prompt('c_prime', 0.0),
+        phi_deg=args.phi_deg if args.phi_deg is not None else prompt('phi_deg', 34.0),
+        k_h=args.k_h if args.k_h is not None else prompt('k_h', 0.16),
+        alpha_min=args.alpha_min if args.alpha_min is not None else prompt('alpha_min', 20.0),
+        alpha_max=args.alpha_max if args.alpha_max is not None else prompt('alpha_max', 60.0),
+        alpha_step=args.alpha_step,
+        output_prefix=args.output_prefix
+    )
+
+    # Post-hoc validation: α range and singularity guard
+    alpha_safe_max = min(ip.alpha_max, (90.0 - ip.phi_deg) - 0.5)
+    if ip.alpha_min >= alpha_safe_max:
+        raise argparse.ArgumentTypeError(
+            f"alpha_min must be < min(alpha_max, 90°-φ-0.5°); got alpha_min={ip.alpha_min}, alpha_max={ip.alpha_max}, φ={ip.phi_deg}"
+        )
+    if ip.alpha_step < 0.5 or ip.alpha_step > 10.0:
+        raise argparse.ArgumentTypeError("alpha_step should be in [0.5, 10] for reasonable resolution.")
+
+    return ip
+
+
+# Main
+def main():
+    ip = get_inputs_from_user()
+    explain_workflow(ip)
+
+    alpha_crit_deg = math.degrees(math.atan((ip.h2 * math.tan(math.radians(ip.beta_deg))) / (ip.h2 + ip.h1)))
+    alpha_safe_max = min(ip.alpha_max, (90.0 - ip.phi_deg) - 0.5)
+
+    # α grid at integer-like increments (as requested)
+    alphas = np.arange(ip.alpha_min, alpha_safe_max + 1e-6, ip.alpha_step)
+    alphas = np.round(alphas, 0)       # round to nearest degree
+    alphas = np.unique(alphas)         # ensure uniqueness if rounding collapses
+
+    # Compute curves
+    E_static = []
+    E_ps = []
+    cases = []
+    for a in alphas:
+        rs = compute_E2_static(float(a), ip); E_static.append(rs['E2_static']); cases.append(rs['case'])
+        rp = compute_E2_pseudostatic(float(a), ip); E_ps.append(rp['E2_ps'])
+    E_static = np.array(E_static)
+    E_ps = np.array(E_ps)
+
+    # Plot
+    plot_curves(alphas, E_static, E_ps, ip, alpha_crit_deg, prefix=ip.output_prefix)
+
+    # CSV export at 1° increments (rounded degrees already)
+    export_csv(alphas, E_static, E_ps, cases, alpha_crit_deg, prefix=ip.output_prefix)
+
+    print("\n✓ Outputs saved:")
+    print(f"  - {ip.output_prefix}_static.png")
+    print(f"  - {ip.output_prefix}_pseudo_static.png")
+    print(f"  - {ip.output_prefix}_overlay.png")
+    print(f"  - {ip.output_prefix}_static_curve.csv")
+    print(f"  - {ip.output_prefix}_pseudostatic_curve.csv")
+
+
+if __name__ == '__main__':
+    main()
