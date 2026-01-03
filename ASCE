@@ -15,7 +15,7 @@ Date: Submitted for Publication in January 2026
 E2 Static & Pseudo-Static Workflow (Vertical-Angle Convention) — v2
 -------------------------------------------------------------------
 Features:
-  1) Professional, step-by-step explanation of the workflow.
+  1) Step-by-step explanation of the workflow.
   2) Robust CLI / interactive inputs with validation and help text.
   3) Three plots:
        (a) Static: E2 vs. α
