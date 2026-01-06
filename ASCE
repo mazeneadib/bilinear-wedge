@@ -1,4 +1,4 @@
-"""
+ython"""
 ================================================================================
 SUPPLEMENTARY MATERIAL: PYTHON IMPLEMENTATION
 Bilinear Wedge Analysis for Active Earth Pressure on Retaining Walls
@@ -78,14 +78,14 @@ def geometry_and_weights_h(alpha_deg: float, ip: Inputs) -> Dict:
     # Back face AO total height (for possible moment checks later)
     H_AO = ip.h1 + ip.h2
     out["H_AO"] = H_AO
-    if alpha_deg >= alpha_crit_h_deg - 1e-9:  # Case A (Two-wedge); corrected to >=
+    if alpha_deg > alpha_crit_h_deg:  # Case A (Two-wedge); revised to strict > (wedge 1 exists only when alpha > alpha_crit)
         # --------------------
         # Case A (Two-wedge)
         # --------------------
         # Vertical distances and horizontal extents (angles from horizontal)
         h_soil = (ip.h1 * math.tan(a)) / (math.tan(a) - math.tan(b))
         h_BC = (ip.h1 + ip.h2) - h_soil
-        if h_BC < 0 or h_soil < 0:  # Safeguard for non-physical (should not occur with fix)
+        if h_BC <= 0 or h_soil < 0:  # Safeguard for non-physical (should not occur with strict >)
             raise ValueError(f"Non-physical geometry at α={alpha_deg}: h_BC={h_BC}, h_soil={h_soil}")
         L1 = h_BC / math.tan(b) # = h_BC * cotβ
         L_BO = L1 / math.cos(b) # plane length along β
@@ -114,7 +114,7 @@ def geometry_and_weights_h(alpha_deg: float, ip: Inputs) -> Dict:
             "W1_total": W1_total, "W2_total": W2_total,
             "W1s": W1s, "W2s": W2s,
         })
-    else:  # Case B (Single-wedge)
+    else:  # Case B (Single-wedge), including when alpha_deg == alpha_crit (wedge 1 does not exist)
         # --------------------
         # Case B (Single-wedge)
         # --------------------
