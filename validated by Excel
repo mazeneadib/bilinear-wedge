@@ -1,0 +1,149 @@
+```python
+import math
+import numpy as np
+
+from dataclasses import dataclass
+
+@dataclass
+class Inputs:
+    h1: float = 3.0  # soil height at heel (ft)
+    h2: float = 25.0  # LCC height (ft)
+    h3: float = 2.0  # pavement thickness (ft)
+    beta_deg: float = 45.0  # LCC interface inclination β (deg from horizontal)
+    deltaA_deg: float = 0.0  # wall-backfill interface friction δ_A (deg from horizontal)
+    gamma_s: float = 120.0  # soil unit weight (pcf)
+    gamma_LCC: float = 40.0  # LCC unit weight (pcf)
+    gamma_p: float = 150.0  # pavement unit weight (pcf)
+    T_l: float = 240.0  # traffic surcharge (psf)
+    c_prime: float = 0.0  # effective cohesion c' (psf)
+    phi_deg: float = 34.0  # soil friction angle φ (deg)
+    k_h: float = 0.16  # horizontal pseudo-static coefficient
+    alpha_min: float = 20.0  # lower bound for trial α (deg from horizontal)
+    alpha_max: float = 60.0  # upper bound for trial α (deg from horizontal)
+    alpha_step: float = 0.1  # step (deg)
+
+def A_h(theta_rad: float, phi_rad: float) -> float:
+    return math.sin(theta_rad) - math.tan(phi_rad) * math.cos(theta_rad)
+
+def B_h(theta_rad: float, phi_rad: float) -> float:
+    return math.cos(theta_rad) + math.tan(phi_rad) * math.sin(theta_rad)
+
+def geometry_and_weights(alpha_deg: float, ip: Inputs) -> dict:
+    alpha_rad = math.radians(alpha_deg)
+    beta_rad = math.radians(ip.beta_deg)
+    # Critical angle
+    alpha_crit_rad = math.atan(((ip.h2 + ip.h1) * math.tan(beta_rad)) / ip.h2)
+    alpha_crit_deg = math.degrees(alpha_crit_rad)
+    out = {"alpha_deg": alpha_deg, "alpha_crit_deg": alpha_crit_deg, "case": None}
+    if alpha_deg > alpha_crit_deg:  # Case A (two-wedge)
+        h_soil = (ip.h1 * math.tan(alpha_rad)) / (math.tan(alpha_rad) - math.tan(beta_rad))
+        h_BC = (ip.h1 + ip.h2) - h_soil
+        if h_BC <= 0 or h_soil < 0:
+            raise ValueError(f"Non-physical geometry at α={alpha_deg}")
+        L1 = h_BC / math.tan(beta_rad)
+        L_BO = L1 / math.cos(beta_rad)
+        L2 = ip.h2 / math.tan(beta_rad) - L1
+        L_AB = h_soil / math.sin(alpha_rad)
+        # Weights for wedge 1
+        V_LCC1 = 0.5 * L1 * h_BC
+        W_LCC1 = ip.gamma_LCC * V_LCC1
+        W_p1 = ip.gamma_p * ip.h3 * L1
+        W_t1 = ip.T_l * L1
+        W1 = W_LCC1 + W_p1 + W_t1
+        W1s = W_LCC1 + W_p1  # exclude traffic
+        # Weights for wedge 2
+        V_w2 = 0.5 * (ip.h2 + ip.h1 + h_BC) * L2
+        V_LCC2 = 0.5 * (ip.h2 + h_BC) * L2
+        V_soil2 = V_w2 - V_LCC2
+        W_LCC2 = ip.gamma_LCC * V_LCC2
+        W_soil2 = ip.gamma_s * V_soil2
+        W_p2 = ip.gamma_p * ip.h3 * L2
+        W_t2 = ip.T_l * L2
+        W2 = W_LCC2 + W_soil2 + W_p2 + W_t2
+        W2s = W_LCC2 + W_soil2 + W_p2  # exclude traffic
+        out.update({
+            "case": "A",
+            "L_AB": L_AB,
+            "W1": W1, "W1s": W1s,
+            "W2": W2, "W2s": W2s,
+            "W_soil": W_soil2, "W_LCC": W_LCC1 + W_LCC2,
+            "W_pavement": W_p1 + W_p2, "W_traffic": W_t1 + W_t2
+        })
+    else:  # Case B (single-wedge)
+        L2 = (ip.h2 + ip.h1) / math.tan(alpha_rad)
+        L_AB = (ip.h1 + ip.h2) / math.sin(alpha_rad)
+        V_LCC = 0.5 * ip.h2**2 / math.tan(beta_rad)
+        V_total = 0.5 * (ip.h2 + ip.h1)**2 / math.tan(alpha_rad)
+        V_soil = V_total - V_LCC
+        W_LCC = ip.gamma_LCC * V_LCC
+        W_soil = ip.gamma_s * V_soil
+        W_pavement = ip.gamma_p * ip.h3 * L2
+        W_traffic = ip.T_l * L2
+        W = W_LCC + W_soil + W_pavement + W_traffic
+        Ws = W_LCC + W_soil + W_pavement  # exclude traffic
+        out.update({
+            "case": "B",
+            "L_AB": L_AB,
+            "W": W, "Ws": Ws,
+            "W_soil": W_soil, "W_LCC": W_LCC,
+            "W_pavement": W_pavement, "W_traffic": W_traffic
+        })
+    return out
+
+def thrust(W: float, c_prime: float, L: float, theta_rad: float, phi_rad: float, k_h: float = 0.0, Ws: float = 0.0) -> float:
+    Ah = A_h(theta_rad, phi_rad)
+    Bh = B_h(theta_rad, phi_rad)
+    if math.fabs(Ah) < 1e-12:
+        return 0.0
+    return k_h * Ws + (Ah / Bh) * W - (c_prime * L) / Bh
+
+def compute_P_A(ip: Inputs, alpha_deg: float) -> float:
+    g = geometry_and_weights(alpha_deg, ip)
+    alpha_rad = math.radians(alpha_deg)
+    beta_rad = math.radians(ip.beta_deg)
+    phi_rad = math.radians(ip.phi_deg)
+    if g["case"] == "A":
+        P1 = thrust(g["W1"], ip.c_prime, g["L_BO"], beta_rad, phi_rad)
+        P2 = thrust(g["W2"], ip.c_prime, g["L_AB"], alpha_rad, phi_rad)
+        return P1 + P2
+    else:
+        return thrust(g["W"], ip.c_prime, g["L_AB"], alpha_rad, phi_rad)
+
+def compute_P_AE(ip: Inputs, alpha_deg: float) -> float:
+    g = geometry_and_weights(alpha_deg, ip)
+    alpha_rad = math.radians(alpha_deg)
+    beta_rad = math.radians(ip.beta_deg)
+    phi_rad = math.radians(ip.phi_deg)
+    if g["case"] == "A":
+        P1 = thrust(g["W1s"], ip.c_prime, g["L_BO"], beta_rad, phi_rad, ip.k_h, g["W1s"])
+        P2 = thrust(g["W2s"], ip.c_prime, g["L_AB"], alpha_rad, phi_rad, ip.k_h, g["W2s"])
+        return P1 + P2
+    else:
+        return thrust(g["Ws"], ip.c_prime, g["L_AB"], alpha_rad, phi_rad, ip.k_h, g["Ws"])
+
+def find_max(ip: Inputs) -> dict:
+    alphas = np.arange(ip.alpha_min, ip.alpha_max + ip.alpha_step / 2, ip.alpha_step)
+    P_A_values = [compute_P_A(ip, a) for a in alphas]
+    P_AE_values = [compute_P_AE(ip, a) for a in alphas]
+    max_P_A_idx = np.argmax(P_A_values)
+    max_P_AE_idx = np.argmax(P_AE_values)
+    return {
+        "alpha_max_P_A": alphas[max_P_A_idx],
+        "max_P_A": P_A_values[max_P_A_idx],
+        "alpha_max_P_AE": alphas[max_P_AE_idx],
+        "max_P_AE": P_AE_values[max_P_AE_idx]
+    }
+
+# Calculation for c' = 0, 100, 200
+c_values = [0, 100, 200]
+for c in c_values:
+    ip = Inputs(c_prime=c)
+    res = find_max(ip)
+    g_P_A = geometry_and_weights(res["alpha_max_P_A"], ip)
+    g_P_AE = geometry_and_weights(res["alpha_max_P_AE"], ip)
+    print(f"For c' = {c} psf:")
+    print(f"  P_A (static): alpha = {res['alpha_max_P_A']:.2f} deg, P = {res['max_P_A']:.2f} lb/ft, L_AB = {g_P_A['L_AB']:.2f} ft")
+    print(f"    Weights: soil = {g_P_A['W_soil']:.2f}, LCC = {g_P_A['W_LCC']:.2f}, pavement = {g_P_A['W_pavement']:.2f}, traffic = {g_P_A['W_traffic']:.2f}")
+    print(f"  P_AE (pseudo-static): alpha = {res['alpha_max_P_AE']:.2f} deg, P = {res['max_P_AE']:.2f} lb/ft, L_AB = {g_P_AE['L_AB']:.2f} ft")
+    print(f"    Weights for P_AE (soil + LCC + pavement): {g_P_AE['W_soil'] + g_P_AE['W_LCC'] + g_P_AE['W_pavement']:.2f}, traffic (excluded) = {g_P_AE['W_traffic']:.2f}\n")
+```
