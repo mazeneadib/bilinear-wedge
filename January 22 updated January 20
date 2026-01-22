@@ -1,0 +1,531 @@
+
+# -*- coding: utf-8 -*-
+"""
+adib_active_wedge.py
+Research-grade, input-driven implementation of the Adib Active Wedge Method.
+
+Implements:
+ - Case A: Two-wedge (A-frame + B-frame with LCC interaction)
+ - Case B: Single equivalent wedge
+For each case:
+ - Static (δ_A = 0)
+ - Pseudo-static (k_h)
+With full force–moment coupling to compute the line of action (moment arm).
+
+THIS CODE DEFINES THE METHOD — no closed-form shortcuts are used.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
+
+# -------------------------
+# Utilities
+# -------------------------
+rad = math.radians
+
+def cot(r: float) -> float:
+    s = math.sin(r)
+    return math.cos(r) / s if abs(s) > 1e-15 else float("inf")
+
+def poly_area_centroid(vertices: List[Tuple[float, float]]) -> Tuple[float, float, float]:
+    """Absolute area and centroid (x,z) of a polygon by shoelace."""
+    A2 = 0.0; Cx = 0.0; Cz = 0.0
+    n = len(vertices)
+    for i in range(n):
+        x1, z1 = vertices[i]
+        x2, z2 = vertices[(i + 1) % n]
+        cr = x1 * z2 - z1 * x2
+        A2 += cr
+        Cx += (x1 + x2) * cr
+        Cz += (z1 + z2) * cr
+    A = A2 / 2.0
+    if abs(A) < 1e-15:
+        return 0.0, 0.0, 0.0
+    Cx /= (6.0 * A)
+    Cz /= (6.0 * A)
+    return abs(A), Cx, Cz
+
+# -------------------------
+# Inputs
+# -------------------------
+@dataclass
+class Inputs:
+    # Geometry
+    h1: float
+    h2: float
+    h3: float
+    beta: float  # deg
+
+    # Materials
+    g_s: float   # soil pcf
+    g_l: float   # LCC pcf
+    g_p: float   # pavement pcf
+    phi: float   # deg
+    c_prime: float  # psf
+
+    # Loads
+    T_l: float   # traffic psf
+
+    # Seismic
+    kh: float    # horizontal pseudo-static coefficient
+
+    # Inclusion flags
+    include_pavement_static: bool = True
+    include_traffic_static: bool = True
+    include_pavement_ps: bool = True
+    include_traffic_ps: bool = False
+
+    # Alpha search
+    alpha_min: float = 15.0
+    alpha_max: float = 75.0
+    alpha_da: float = 0.5
+
+    @property
+    def H(self) -> float:
+        return self.h1 + self.h2
+
+# -------------------------
+# Model helpers
+# -------------------------
+def alpha_crit(beta_deg: float, H: float, h2: float) -> float:
+    """Lower bound for alpha search from geometry compatibility."""
+    b = rad(beta_deg)
+    return math.degrees(math.atan((H * math.tan(b)) / h2)) if h2 > 0 else 90.0
+
+def thrust_eq21(theta_deg: float, W: float, phi_deg: float, kh: float,
+                c_prime: float, Lc: float) -> float:
+    """
+    Governing thrust equation (Eq. 21), δ_A=0 (as in user's implementation).
+
+    P = [ W (sinθ - cosθ tanφ + kh (cosθ + sinθ tanφ)) - c' Lc ] / (cosθ + sinθ tanφ)
+    """
+    th = rad(theta_deg)
+    ph = rad(phi_deg)
+    denom = math.cos(th) + math.sin(th) * math.tan(ph)
+    if abs(denom) < 1e-15:
+        return 0.0
+    num = W * (math.sin(th) - math.cos(th) * math.tan(ph) + kh * (math.cos(th) + math.sin(th) * math.tan(ph))) - c_prime * Lc
+    return num / denom
+
+# -------------------------
+# Case A geometry (polygons + centroids)
+# -------------------------
+@dataclass
+class CaseAData:
+    alpha: float; beta: float
+    h_soil: float; h_BC: float; L1: float; L2: float
+    # volumes and centroids
+    V_soil2: float; xS2: float; zS2: float
+    V_LCC2: float;  xL2: float; zL2: float
+    V_LCC1: float;  xL1: float; zL1: float
+    # strips (static definitions; pseudo-static uses flags)
+    Wp2: float; Wt2: float; e_p2: float; e_t2: float
+    Wp1: float; Wt1: float; e_p1: float; e_t1: float
+    # weights
+    W_soil2: float; W_LCC2: float; W2_body: float; W2_static: float
+    W_LCC1: float;  W1_static: float
+    # contact lengths
+    L_AB: float; L_BO: float
+
+def build_caseA(alpha_deg: float, inp: Inputs) -> CaseAData:
+    a = rad(alpha_deg); b = rad(inp.beta)
+    H = inp.H
+    # Intersection elevation and base lengths
+    denom = (math.tan(a) - math.tan(b))
+    h_soil = inp.h1 * math.tan(a) / denom if abs(denom) > 1e-15 else H
+    h_BC   = H - h_soil
+    L2     = h_soil * cot(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    L1     = h_BC   * cot(b) if abs(math.sin(b)) > 1e-15 else 0.0
+
+    # Points
+    A_pt = (0.0, 0.0)
+    O_pt = (0.0, inp.h1)
+    Op_pt = (0.0, H)
+    B_pt = (L2, h_soil)
+    C_pt = (L2, H)
+
+    # Areas and centroids
+    V_soil2, xS2, zS2 = poly_area_centroid([A_pt, O_pt, B_pt])
+    V_LCC2,  xL2, zL2 = poly_area_centroid([O_pt, Op_pt, C_pt, B_pt])
+    V_LCC1 = 0.5 * L1 * h_BC
+
+    # Wedge 1 centroid (B-frame triangle mapped as in your code)
+    xL1 = L2 + L1 / 3.0
+    zL1 = h_soil + 2.0 * h_BC / 3.0
+
+    # Strips (static)
+    Wp2 = inp.g_p * inp.h3 * L2; Wt2 = inp.T_l * L2; e_p2 = e_t2 = L2 / 2.0
+    Wp1 = inp.g_p * inp.h3 * L1; Wt1 = inp.T_l * L1; e_p1 = e_t1 = L2 + L1 / 2.0
+
+    # Weights
+    W_soil2 = inp.g_s * V_soil2
+    W_LCC2  = inp.g_l * V_LCC2
+    W2_body = W_soil2 + W_LCC2
+    W2_static = W2_body \
+        + (Wp2 if inp.include_pavement_static else 0.0) \
+        + (Wt2 if inp.include_traffic_static else 0.0)
+
+    W_LCC1 = inp.g_l * V_LCC1
+    W1_static = W_LCC1 \
+        + (Wp1 if inp.include_pavement_static else 0.0) \
+        + (Wt1 if inp.include_traffic_static else 0.0)
+
+    # Contacts
+    L_AB = h_soil / math.sin(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    L_BO = L1     / math.cos(b) if abs(math.cos(b)) > 1e-15 else 0.0
+
+    return CaseAData(alpha_deg, inp.beta, h_soil, h_BC, L1, L2,
+                     V_soil2, xS2, zS2, V_LCC2, xL2, zL2,
+                     V_LCC1, xL1, zL1,
+                     Wp2, Wt2, e_p2, e_t2, Wp1, Wt1, e_p1, e_t1,
+                     W_soil2, W_LCC2, W2_body, W2_static, W_LCC1, W1_static,
+                     L_AB, L_BO)
+
+# -------------------------
+# Case A: z_p1 from Wedge 1 moments about B (static)
+# -------------------------
+def zp1_from_wedge1(P1: float, data: CaseAData) -> float:
+    a = rad(data.alpha); cosA = math.cos(a)
+    # Moments of included weights about B in B-frame
+    sum_eW_B = data.W_LCC1*(data.L1/3.0) \
+             + data.Wp1*(data.L1/2.0) \
+             + data.Wt1*(data.L1/2.0)
+    W1s = data.W_LCC1 + data.Wp1 + data.Wt1
+    e1_B = sum_eW_B / W1s if W1s > 0 else 0.0
+    # Mapping to plane lever arm
+    g1 = e1_B / cosA if abs(cosA) > 1e-15 else 0.0
+    # Normal resultant for wedge 1 (static)
+    N1_st = W1s * cosA + P1 * math.sin(a)
+    # z_p1 from moment balance: P1 z_p1 = g1 N1_st - sum_eW_B
+    return (g1 * N1_st - sum_eW_B) / P1 if abs(P1) > 1e-12 else 0.0
+
+# -------------------------
+# Case A: static (with P1 moment term and admissibility)
+# -------------------------
+def caseA_static(alpha_deg: float, inp: Inputs) -> Dict:
+    data = build_caseA(alpha_deg, inp)
+
+    # Thrusts
+    P1 = thrust_eq21(inp.beta,  data.W1_static, inp.phi, 0.0, inp.c_prime, data.L_BO)
+    P2 = thrust_eq21(alpha_deg, data.W2_static, inp.phi, 0.0, inp.c_prime, data.L_AB)
+
+    include1 = P1 > 0.0
+    P_A = P2 + (P1 if include1 else 0.0)
+
+    a = rad(alpha_deg); cosA = math.cos(a)
+
+    # Centroidal arms for included weights (static)
+    e2_num = data.W_soil2*data.xS2 + data.W_LCC2*data.xL2 \
+           + (data.Wp2*data.e_p2 if inp.include_pavement_static else 0.0) \
+           + (data.Wt2*data.e_t2 if inp.include_traffic_static else 0.0)
+    e2_den = data.W2_static if data.W2_static > 0 else 1.0
+    e2_tot = e2_num / e2_den
+
+    e1_tot = 0.0
+    if include1 and data.W1_static > 0:
+        e1_num = data.W_LCC1*data.xL1 \
+               + (data.Wp1*data.e_p1 if inp.include_pavement_static else 0.0) \
+               + (data.Wt1*data.e_t1 if inp.include_traffic_static else 0.0)
+        e1_tot = e1_num / data.W1_static
+
+    # Composite g_st
+    sumW = data.W2_static + (data.W1_static if include1 else 0.0)
+    g_st_num = (data.W2_static * (e2_tot / cosA if abs(cosA) > 1e-15 else 0.0)) \
+             + ((data.W1_static * (e1_tot / cosA if abs(cosA) > 1e-15 else 0.0)) if include1 else 0.0)
+    g_st = g_st_num / sumW if sumW > 0 else 0.0
+
+    # Normal resultant
+    N_st = sumW * cosA + P_A * math.sin(a)
+
+    # Weight moment
+    sumWe = data.W2_static * e2_tot + ((data.W1_static * e1_tot) if include1 else 0.0)
+
+    # Additional interaction from wedge 1
+    add_term = 0.0
+    z_p1 = None
+    if include1:
+        z_p1 = zp1_from_wedge1(P1, data)
+        add_term = P1 * (z_p1 + data.h_soil)
+
+    # Moment arm
+    h_st = (g_st * N_st - sumWe + add_term) / P_A if abs(P_A) > 1e-12 else 0.0
+
+    return {
+        "data": data,
+        "P1": P1,
+        "P2": P2,
+        "P_A": P_A,
+        "include1": include1,
+        "g_st": g_st,
+        "N_st": N_st,
+        "sumWe": sumWe,
+        "add_term": add_term,
+        "h_st": h_st,
+        "z_p1": z_p1,
+        "e2_tot": e2_tot,
+        "e1_tot": e1_tot,
+    }
+
+# -------------------------
+# Case A: pseudo-static (selective inclusion)
+# -------------------------
+def caseA_pseudostatic(alpha_deg: float, inp: Inputs) -> Dict:
+    data = build_caseA(alpha_deg, inp)
+    a = rad(alpha_deg); cosA = math.cos(a)
+
+    # Seismic weights (exclude/include strips per flags)
+    W1s = data.W_LCC1 \
+        + (data.Wp1 if inp.include_pavement_ps else 0.0) \
+        + (data.Wt1 if inp.include_traffic_ps else 0.0)
+    W2s = data.W2_body \
+        + (data.Wp2 if inp.include_pavement_ps else 0.0) \
+        + (data.Wt2 if inp.include_traffic_ps else 0.0)
+
+    P1E = thrust_eq21(inp.beta,  W1s, inp.phi, inp.kh, inp.c_prime, data.L_BO)
+    P2E = thrust_eq21(alpha_deg, W2s, inp.phi, inp.kh, inp.c_prime, data.L_AB)
+
+    include1 = P1E > 0.0
+    P_AE = P2E + (P1E if include1 else 0.0)
+
+    # Composite body centroid for positions
+    x2 = (data.W_soil2*data.xS2 + data.W_LCC2*data.xL2) / data.W2_body if data.W2_body > 0 else 0.0
+    z2 = (data.W_soil2*data.zS2 + data.W_LCC2*data.zL2) / data.W2_body if data.W2_body > 0 else 0.0
+
+    # g_ps weighting by pseudo-static normals
+    w2n = (W2s * math.cos(a) + inp.kh * W2s * math.sin(a))
+    num = w2n * (x2 / cosA if abs(cosA) > 1e-15 else 0.0)
+    den = w2n
+    if include1:
+        w1n = (W1s * math.cos(a) + inp.kh * W1s * math.sin(a))
+        num += w1n * (data.xL1 / cosA if abs(cosA) > 1e-15 else 0.0)
+        den += w1n
+    g_ps = num / den if abs(den) > 1e-15 else 0.0
+
+    Wsum = W2s + (W1s if include1 else 0.0)
+    N_ps = Wsum * math.cos(a) - inp.kh * Wsum * math.sin(a) + P_AE * math.sin(a)
+
+    sum_eW = W2s * x2 + ((W1s * data.xL1) if include1 else 0.0)
+    sum_zkW = inp.kh * (W2s * z2 + ((W1s * data.zL1) if include1 else 0.0))
+
+    h_ps = (g_ps * N_ps - sum_eW + sum_zkW) / P_AE if abs(P_AE) > 1e-12 else 0.0
+
+    return {
+        "data": data,
+        "P1E": P1E,
+        "P2E": P2E,
+        "P_AE": P_AE,
+        "include1": include1,
+        "g_ps": g_ps,
+        "N_ps": N_ps,
+        "sum_eW": sum_eW,
+        "sum_zkW": sum_zkW,
+        "h_ps": h_ps,
+    }
+
+# -------------------------
+# Case B (single wedge)
+# -------------------------
+@dataclass
+class CaseBData:
+    alpha: float; beta: float
+    L2: float; V_tot: float; V_LCC: float; V_soil: float
+    W_LCC: float; W_soil: float; W_body: float
+    Wp: float; Wt: float; e_p: float; e_t: float
+    W_static: float; L_AB: float
+
+def build_caseB(alpha_deg: float, inp: Inputs) -> CaseBData:
+    a = rad(alpha_deg); b = rad(inp.beta)
+    H = inp.H
+
+    L2 = H * cot(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    V_tot = 0.5 * H * H * cot(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    V_LCC = 0.5 * inp.h2 * inp.h2 * cot(b) if abs(math.sin(b)) > 1e-15 else 0.0
+    V_soil = V_tot - V_LCC
+
+    W_LCC = inp.g_l * V_LCC
+    W_soil = inp.g_s * V_soil
+    W_body = W_LCC + W_soil
+
+    x_LCC = (1.0/3.0) * inp.h2 * cot(b) if abs(math.sin(b)) > 1e-15 else 0.0
+    z_LCC = inp.h1 + (2.0/3.0) * inp.h2
+
+    # composite soil centroid (closed-form used in your prior code)
+    num_x = (H**3)*(cot(a)**2) - (inp.h2**3)*(cot(b)**2)
+    den   = 3.0*((H**2)*cot(a) - (inp.h2**2)*cot(b))
+    x_soil = num_x / den if abs(den) > 1e-15 else 0.0
+
+    num_z  = 2.0*(H**3)*cot(a) - (inp.h2**2)*cot(b)*(3.0*inp.h1 + 2.0*inp.h2)
+    z_soil = num_z / den if abs(den) > 1e-15 else 0.0
+
+    Wp = inp.g_p * inp.h3 * L2
+    Wt = inp.T_l * L2
+    e_p = e_t = L2 / 2.0
+
+    W_static = W_body \
+        + (Wp if inp.include_pavement_static else 0.0) \
+        + (Wt if inp.include_traffic_static else 0.0)
+
+    L_AB = H / math.sin(a) if abs(math.sin(a)) > 1e-15 else 0.0
+
+    return CaseBData(alpha_deg, inp.beta, L2, V_tot, V_LCC, V_soil,
+                     W_LCC, W_soil, W_body, x_LCC, z_LCC, x_soil, z_soil,
+                     Wp, Wt, e_p, e_t, W_static, L_AB)
+
+def caseB_static(alpha_deg: float, inp: Inputs) -> Dict:
+    data = build_caseB(alpha_deg, inp)
+    a = rad(alpha_deg); cosA = math.cos(a)
+
+    P_A = thrust_eq21(alpha_deg, data.W_static, inp.phi, 0.0, inp.c_prime, data.L_AB)
+
+    # centroid for moment arm
+    x_body = (data.W_soil*data.x_soil + data.W_LCC*data.x_LCC) / data.W_body if data.W_body > 0 else 0.0
+    e_tot = (data.W_body * x_body
+             + (data.Wp * data.e_p if inp.include_pavement_static else 0.0)
+             + (data.Wt * data.e_t if inp.include_traffic_static else 0.0)) / data.W_static if data.W_static > 0 else 0.0
+
+    g_st = e_tot / cosA if abs(cosA) > 1e-15 else 0.0
+    N_st = data.W_static * math.cos(a) + P_A * math.sin(a)
+
+    h_st = (g_st * N_st - data.W_static * e_tot) / P_A if abs(P_A) > 1e-12 else 0.0
+
+    return {
+        "data": data,
+        "P_A": P_A,
+        "h_st": h_st,
+        "g_st": g_st,
+        "N_st": N_st,
+        "e_tot": e_tot,
+    }
+
+def caseB_pseudostatic(alpha_deg: float, inp: Inputs) -> Dict:
+    data = build_caseB(alpha_deg, inp)
+    a = rad(alpha_deg); cosA = math.cos(a)
+
+    Wps = data.W_body \
+        + (data.Wp if inp.include_pavement_ps else 0.0) \
+        + (data.Wt if inp.include_traffic_ps else 0.0)
+
+    P_AE = thrust_eq21(alpha_deg, Wps, inp.phi, inp.kh, inp.c_prime, data.L_AB)
+
+    x_body = (data.W_soil*data.x_soil + data.W_LCC*data.x_LCC) / data.W_body if data.W_body > 0 else 0.0
+    z_body = (data.W_soil*data.z_soil + data.W_LCC*data.z_LCC) / data.W_body if data.W_body > 0 else 0.0
+
+    g_ps = x_body / cosA if abs(cosA) > 1e-15 else 0.0
+    N_ps = data.W_body * math.cos(a) - inp.kh * data.W_body * math.sin(a) + P_AE * math.sin(a)
+
+    h_ps = (g_ps * N_ps - data.W_body * x_body + inp.kh * data.W_body * z_body) / P_AE if abs(P_AE) > 1e-12 else 0.0
+
+    return {
+        "data": data,
+        "P_AE": P_AE,
+        "h_ps": h_ps,
+        "g_ps": g_ps,
+        "N_ps": N_ps,
+        "x_body": x_body,
+        "z_body": z_body,
+    }
+
+# -------------------------
+# Evaluators (scan alpha and pick governing thrust)
+# -------------------------
+def evaluate_case_A(inp: Inputs) -> Dict:
+    acrit = alpha_crit(inp.beta, inp.H, inp.h2)
+    best_st = None; best_ps = None
+    best_st_rec = None; best_ps_rec = None
+
+    a = max(inp.alpha_min, acrit + 1e-6)
+    while a <= inp.alpha_max + 1e-9:
+        rec_st = caseA_static(a, inp)
+        if (best_st is None) or (rec_st["P_A"] > best_st):
+            best_st = rec_st["P_A"]; best_st_rec = {"alpha": a, **rec_st}
+        rec_ps = caseA_pseudostatic(a, inp)
+        if (best_ps is None) or (rec_ps["P_AE"] > best_ps):
+            best_ps = rec_ps["P_AE"]; best_ps_rec = {"alpha": a, **rec_ps}
+        a += inp.alpha_da
+
+    return {
+        "alpha_crit": acrit,
+        "static": best_st_rec,
+        "pseudo": best_ps_rec,
+    }
+
+def evaluate_case_B(inp: Inputs) -> Dict:
+    acrit = alpha_crit(inp.beta, inp.H, inp.h2)
+    best_st = None; best_ps = None
+    best_st_rec = None; best_ps_rec = None
+
+    a = inp.alpha_min
+    while a <= min(inp.alpha_max, acrit) + 1e-9:
+        rec_st = caseB_static(a, inp)
+        if (best_st is None) or (rec_st["P_A"] > best_st):
+            best_st = rec_st["P_A"]; best_st_rec = {"alpha": a, **rec_st}
+        rec_ps = caseB_pseudostatic(a, inp)
+        if (best_ps is None) or (rec_ps["P_AE"] > best_ps):
+            best_ps = rec_ps["P_AE"]; best_ps_rec = {"alpha": a, **rec_ps}
+        a += inp.alpha_da
+
+    return {
+        "alpha_crit": acrit,
+        "static": best_st_rec,
+        "pseudo": best_ps_rec,
+    }
+
+# -------------------------
+# LaTeX table emitter (paper-ready)
+# -------------------------
+def emit_latex_table(rows: List[Dict]) -> str:
+    lines = []
+    lines.append(r"\begin{tabular}{llrrrrrr}")
+    lines.append(r"\toprule")
+    lines.append(r"Case & Regime & $\alpha^*_\mathrm{st}$ & $P_A$ & $h_{\mathrm{st}}$ & $\alpha^*_\mathrm{ps}$ & $P_{AE}$ & $h_{\mathrm{ps}}$ \\")
+    lines.append(r"\midrule")
+    for r in rows:
+        lines.append(
+            f"{r['name']} & A & {r['A_static_alpha']:.2f} & {r['A_P_A']:.2f} & {r['A_h_st']:.2f} & "
+            f"{r['A_pseudo_alpha']:.2f} & {r['A_P_AE']:.2f} & {r['A_h_ps']:.2f} \\"
+        )
+        lines.append(
+            f"{r['name']} & B & {r['B_static_alpha']:.2f} & {r['B_P_A']:.2f} & {r['B_h_st']:.2f} & "
+            f"{r['B_pseudo_alpha']:.2f} & {r['B_P_AE']:.2f} & {r['B_h_ps']:.2f} \\"
+        )
+    lines.append(r"\bottomrule")
+    lines.append(r"\end{tabular}")
+    return "\n".join(lines)
+
+# -------------------------
+# Example main
+# -------------------------
+if __name__ == "__main__":
+    # Example: user's stated scenario (adjust flags as needed)
+    inp = Inputs(
+        h1=3.0, h2=45.0, h3=2.0,
+        g_s=120.0, g_l=40.0, g_p=150.0,
+        T_l=240.0,
+        beta=45.0, phi=34.0,
+        c_prime=300.0, kh=0.16,
+        include_pavement_static=True, include_traffic_static=True,
+        include_pavement_ps=True, include_traffic_ps=False
+    )
+
+    resA = evaluate_case_A(inp)
+    resB = evaluate_case_B(inp)
+
+    print(f"Case A: alpha_crit = {resA['alpha_crit']:.4f}°")
+    print(f"  STATIC : alpha*={resA['static']['alpha']:.2f}°,  P_A={resA['static']['P_A']:.2f} lb/ft,  h_st={resA['static']['h_st']:.3f} ft")
+    print(f"  PSEUDO : alpha*={resA['pseudo']['alpha']:.2f}°,  P_AE={resA['pseudo']['P_AE']:.2f} lb/ft, h_ps={resA['pseudo']['h_ps']:.3f} ft")
+
+    print(f"Case B: alpha_crit = {resB['alpha_crit']:.4f}°")
+    print(f"  STATIC : alpha*={resB['static']['alpha']:.2f}°,  P_A={resB['static']['P_A']:.2f} lb/ft,  h_st={resB['static']['h_st']:.3f} ft")
+    print(f"  PSEUDO : alpha*={resB['pseudo']['alpha']:.2f}°,  P_AE={resB['pseudo']['P_AE']:.2f} lb/ft, h_ps={resB['pseudo']['h_ps']:.3f} ft")
+
+    rows = [{
+        "name": "UserCase",
+        "A_static_alpha": resA["static"]["alpha"], "A_P_A": resA["static"]["P_A"], "A_h_st": resA["static"]["h_st"],
+        "A_pseudo_alpha": resA["pseudo"]["alpha"], "A_P_AE": resA["pseudo"]["P_AE"], "A_h_ps": resA["pseudo"]["h_ps"],
+        "B_static_alpha": resB["static"]["alpha"], "B_P_A": resB["static"]["P_A"], "B_h_st": resB["static"]["h_st"],
+        "B_pseudo_alpha": resB["pseudo"]["alpha"], "B_P_AE": resB["pseudo"]["P_AE"], "B_h_ps": resB["pseudo"]["h_ps"],
+    }]
+
+    print("\nLaTeX table:")
+    print(emit_latex_table(rows))
