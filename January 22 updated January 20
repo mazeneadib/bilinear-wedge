@@ -185,20 +185,30 @@ def build_caseA(alpha_deg: float, inp: Inputs) -> CaseAData:
 # -------------------------
 # Case A: z_p1 from Wedge 1 moments about B (static)
 # -------------------------
+
 def zp1_from_wedge1(P1: float, data: CaseAData) -> float:
-    a = rad(data.alpha); cosA = math.cos(a)
+    # Use B-frame inclination (beta) for Wedge 1 mapping and normal
+    b = math.radians(data.beta)
+    cosB = math.cos(b); sinB = math.sin(b)
+
     # Moments of included weights about B in B-frame
-    sum_eW_B = data.W_LCC1*(data.L1/3.0) \
-             + data.Wp1*(data.L1/2.0) \
-             + data.Wt1*(data.L1/2.0)
+    sum_eW_B = (
+        data.W_LCC1*(data.L1/3.0)
+        + data.Wp1*(data.L1/2.0)
+        + data.Wt1*(data.L1/2.0)
+    )
     W1s = data.W_LCC1 + data.Wp1 + data.Wt1
     e1_B = sum_eW_B / W1s if W1s > 0 else 0.0
-    # Mapping to plane lever arm
-    g1 = e1_B / cosA if abs(cosA) > 1e-15 else 0.0
-    # Normal resultant for wedge 1 (static)
-    N1_st = W1s * cosA + P1 * math.sin(a)
-    # z_p1 from moment balance: P1 z_p1 = g1 N1_st - sum_eW_B
+
+    # Mapping to plane lever arm (divide by cos(beta), not cos(alpha))
+    g1 = e1_B / cosB if abs(cosB) > 1e-15 else 0.0
+
+    # Wedge 1 normal resultant resolved in the B-frame
+    N1_st = W1s * cosB + P1 * sinB
+
+    # z_p1 from B-frame moment balance
     return (g1 * N1_st - sum_eW_B) / P1 if abs(P1) > 1e-12 else 0.0
+
 
 # -------------------------
 # Case A: static (with P1 moment term and admissibility)
