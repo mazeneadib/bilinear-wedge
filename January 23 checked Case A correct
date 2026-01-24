@@ -231,25 +231,19 @@ def zp1_from_wedge1(P1: float, data: CaseAData) -> float:
 # -------------------------
 # Case A: static (Stage 3 uses WEDGE 2 ONLY inside N_st and g_st)
 # -------------------------
+
 def caseA_static(alpha_deg: float, inp: Inputs) -> Dict:
-    """
-    Case A (static): global line of action h_st for P_A (A-plane).
-    Stage 1 (Wedge 1 only): compute P1, z_p1; M1 = P1*(z_p1 + h_soil) if P1>0, else 0.
-    Stage 2 (Wedge 2 only): compute P2, W2_static, e2_tot, g_st, N_st (with P2, not P_A).
-    Stage 3: P_A = P2 + max(P1,0); h_st = (g_st*N_st - W2_static*e2_tot + M1) / P_A.
-    """
     data = build_caseA(alpha_deg, inp)
     a = rad(alpha_deg)
 
-    # --- Stage 1: Wedge 1 only
+    # Stage 1 (Wedge 1 only)
     P1 = thrust_eq21(inp.beta, data.W1_static, inp.phi, 0.0, inp.c_prime, data.L_BO)
     include1 = (P1 > 0.0)
     z_p1 = zp1_from_wedge1(P1, data) if include1 else 0.0
     M_1 = P1 * (z_p1 + data.h_soil) if include1 else 0.0
 
-    # --- Stage 2: Wedge 2 only
+    # Stage 2 (Wedge 2 only)
     P2 = thrust_eq21(alpha_deg, data.W2_static, inp.phi, 0.0, inp.c_prime, data.L_AB)
-    # total horizontal lever for static (Wedge 2 only)
     e2_num = (
         data.W_soil2 * data.xS2
         + data.W_LCC2 * data.xL2
@@ -259,10 +253,10 @@ def caseA_static(alpha_deg: float, inp: Inputs) -> Dict:
     e2_tot = e2_num / data.W2_static if data.W2_static > 0 else 0.0
     g_st = e2_tot / math.cos(a) if abs(math.cos(a)) > 1e-15 else 0.0
 
-    # Wedge-2-only in-plane normal:
+    # Wedge-2-only in-plane normal (STATIC) -- uses P2, not P_A
     N_st = data.W2_static * math.cos(a) + P2 * math.sin(a)
 
-    # --- Stage 3: global thrust and moment arm on A-plane
+    # Stage 3 (global)
     P_A = P2 + (P1 if include1 else 0.0)
     h_st = (g_st * N_st - data.W2_static * e2_tot + M_1) / P_A if abs(P_A) > 1e-12 else 0.0
 
@@ -273,59 +267,62 @@ def caseA_static(alpha_deg: float, inp: Inputs) -> Dict:
         "P_A": P_A, "h_st": h_st,
         "geom": data,
     }
-
 # -------------------------
 # Case A: pseudo-static (Stage 3 uses WEDGE 2 ONLY inside N_ps and g_ps)
 # -------------------------
+
 def caseA_pseudostatic(alpha_deg: float, inp: Inputs) -> Dict:
-    """
-    Case A (pseudo-static): global line of action h_ps for P_AE (A-plane).
-    Stage 1 (Wedge 1 only): compute P1E on beta (no vertical blending to Stage 3).
-    Stage 2 (Wedge 2 only): build W2_ps, composite (x2,z2), g_ps = x2/cos(alpha).
-    Stage 3: N_ps = W2_ps cos(alpha) - kh W2_ps sin(alpha) + P2E sin(alpha).
-             P_AE = P2E + max(P1E, 0).
-             h_ps = (g_ps*N_ps - W2_ps*x2 + kh W2_ps*z2) / P_AE.
-    """
     data = build_caseA(alpha_deg, inp)
     a = rad(alpha_deg)
 
-    # Wedge-2 body centroid for pseudo-static positions
-    x2 = (data.W_soil2 * data.xS2 + data.W_LCC2 * data.xL2) / data.W2_body if data.W2_body > 0 else 0.0
-    z2 = (data.W_soil2 * data.zS2 + data.W_LCC2 * data.zL2) / data.W2_body if data.W2_body > 0 else 0.0
+    # Wedge 2 body centroid (soil + LCC) -- body-only
+    x2_body = (data.W_soil2 * data.xS2 + data.W_LCC2 * data.xL2) / data.W2_body if data.W2_body > 0 else 0.0
+    z2_body = (data.W_soil2 * data.zS2 + data.W_LCC2 * data.zL2) / data.W2_body if data.W2_body > 0 else 0.0
 
-    # Pseudo-static weights (pavement ps on/off and traffic ps off, per flags)
-    W2_ps = data.W2_body + (data.Wp2 if inp.include_pavement_ps else 0.0) \
-                       + (data.Wt2 if inp.include_traffic_ps else 0.0)  # typically traffic_ps=False
+    # ps weights (pavement ps per flag; traffic ps per flag)
+    W2_ps = data.W2_body \
+        + (data.Wp2 if inp.include_pavement_ps else 0.0) \
+        + (data.Wt2 if inp.include_traffic_ps else 0.0)
 
-    W1_ps = data.W_LCC1 + (data.Wp1 if inp.include_pavement_ps else 0.0) \
-                      + (data.Wt1 if inp.include_traffic_ps else 0.0)
+    # Composite centroid INCLUDING pavement (and traffic if you flip the flag)
+    x_pav = data.L2 / 2.0
+    z_pav = inp.H + inp.h3 / 2.0
+    if W2_ps > 0:
+        x2_ps = (data.W2_body * x2_body
+                 + (data.Wp2 if inp.include_pavement_ps else 0.0) * x_pav
+                 + (data.Wt2 if inp.include_traffic_ps else 0.0) * x_pav) / W2_ps
+        z2_ps = (data.W2_body * z2_body
+                 + (data.Wp2 if inp.include_pavement_ps else 0.0) * z_pav
+                 + (data.Wt2 if inp.include_traffic_ps else 0.0) * inp.H) / W2_ps
+    else:
+        x2_ps = 0.0; z2_ps = 0.0
 
-    # Thrusts (ps):
+    # Per-wedge ps thrusts
     P2E = thrust_eq21(alpha_deg, W2_ps, inp.phi, inp.kh, inp.c_prime, data.L_AB)
+    W1_ps = data.W_LCC1 + (data.Wp1 if inp.include_pavement_ps else 0.0) + (data.Wt1 if inp.include_traffic_ps else 0.0)
     P1E = thrust_eq21(inp.beta, W1_ps, inp.phi, inp.kh, inp.c_prime, data.L_BO)
 
-    # Wedge-2-only in-plane lever and normal:
-    g_ps = x2 / math.cos(a) if abs(math.cos(a)) > 1e-15 else 0.0
+    # Wedge-2-only in-plane normal (PSEUDO-STATIC) -- uses P2E, not P_AE
+    g_ps = x2_ps / math.cos(a) if abs(math.cos(a)) > 1e-15 else 0.0
     N_ps = W2_ps * math.cos(a) - inp.kh * W2_ps * math.sin(a) + P2E * math.sin(a)
 
-    # Global pseudo-static thrust:
+    # Global pseudo-static thrust
     P_AE = P2E + (P1E if P1E > 0.0 else 0.0)
 
-    # Numerator (Wedge 2 only):
-    sum_eW = W2_ps * x2
-    sum_zkW = inp.kh * W2_ps * z2
+    # Numerator terms (Wedge 2 only)
+    sum_eW = W2_ps * x2_ps
+    sum_zkW = inp.kh * W2_ps * z2_ps
 
     h_ps = (g_ps * N_ps - sum_eW + sum_zkW) / P_AE if abs(P_AE) > 1e-12 else 0.0
 
     return {
         "alpha": alpha_deg,
         "P2E": P2E, "P1E": P1E, "P_AE": P_AE,
-        "W2_ps": W2_ps, "x2": x2, "z2": z2,
+        "W2_ps": W2_ps, "x2_ps": x2_ps, "z2_ps": z2_ps,
         "g_ps": g_ps, "N_ps": N_ps, "sum_eW": sum_eW, "sum_zkW": sum_zkW,
         "h_ps": h_ps,
         "geom": data,
     }
-
 # -------------------------
 # Evaluators (scan alpha and pick governing thrust)
 # -------------------------
