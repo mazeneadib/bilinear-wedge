@@ -1,0 +1,443 @@
+
+# -*- coding: utf-8 -*-
+"""
+adib_active_wedge.py
+Patched & expanded: 2026-01-26
+
+Research-grade implementation of the Adib Active Wedge Method.
+
+Covers:
+- Case A (two wedges): Wedge 2 in A-frame with exact centroids; Wedge 1 in B-frame.
+- Case B (single wedge, legacy centroids).
+
+For each case:
+- Static (δ_A = 0)
+- Pseudo-static (k_h > 0)
+
+CRITICAL RULES (per 2026-01 clarifications):
+- CASE A, STAGE 3 (global on A-plane):
+  * STATIC normal uses WEDGE 2 ONLY:
+        N_st = W2_static * cos(alpha) + P2 * sin(alpha)
+    (Use P2, not P_A, inside N_st.)
+  * PSEUDO-STATIC normal uses WEDGE 2 ONLY:
+        N_ps = W2_ps * cos(alpha) - kh * W2_ps * sin(alpha) + P2E * sin(alpha)
+    (Use P2E, not P_AE, inside N_ps.)
+  * Wedge 1 contributes ONLY via static add-moment:
+        M1 = P1 * (z_p1 + h_soil)      if P1 > 0, else M1 = 0.
+  * Denominators remain:
+        P_A  = P2  + max(P1,  0)
+        P_AE = P2E + max(P1E, 0)
+
+- PSEUDO-STATIC centroid for Stage 3 Case A is COMPOSITE (body + pavement):
+    x2_ps = (W2_body * x2_body + Wp2 * (L2/2)         [+ Wt2 * (L2/2) if include_traffic_ps]) / W2_ps
+    z2_ps = (W2_body * z2_body + Wp2 * (H + h3/2)      [+ Wt2 * (H)     if include_traffic_ps]) / W2_ps
+
+- Pavement resultant vertical location for reporting is z = H + h3/2.
+- Static strips use only horizontal levers (L/2). No vertical strip lever in static Stage 3.
+
+The module scans alpha and reports the governing (maximum) lateral thrust and
+its moment arm for BOTH Case A and Case B, in BOTH Static and Pseudo-static regimes.
+All relevant intermediate values are preserved in the returned dictionaries.
+"""
+
+import math
+from dataclasses import dataclass
+from typing import Dict, Optional
+
+# -------------------------
+# Utilities
+# -------------------------
+
+rad = math.radians
+
+def cot(r: float) -> float:
+    s = math.sin(r)
+    return math.cos(r) / s if abs(s) > 1e-15 else float("inf")
+
+def thrust_eq21(theta_deg: float, W: float, phi_deg: float, kh: float, c_prime: float, Lc: float) -> float:
+    """
+    Eq. 21 style thrust (δ_A=0 in static):
+        P = [ W (sinθ - cosθ tanφ + kh (cosθ + sinθ tanφ)) - c' Lc ] / (cosθ + sinθ tanφ)
+    """
+    th = rad(theta_deg)
+    ph = rad(phi_deg)
+    denom = math.cos(th) + math.sin(th) * math.tan(ph)
+    if abs(denom) < 1e-15:
+        return 0.0
+    num = W * (math.sin(th) - math.cos(th) * math.tan(ph) + kh * (math.cos(th) + math.sin(th) * math.tan(ph))) - c_prime * Lc
+    return num / denom
+
+def alpha_crit(beta_deg: float, H: float, h2: float) -> float:
+    """
+    Admissibility bound for Case A/B alpha partition:
+        Case A:  alpha >= alpha_crit
+        Case B:  alpha <= alpha_crit
+    """
+    b = rad(beta_deg)
+    return math.degrees(math.atan((H * math.tan(b)) / h2)) if h2 > 0 else 90.0
+
+# -------------------------
+# Inputs
+# -------------------------
+
+@dataclass
+class Inputs:
+    # Geometry
+    h1: float
+    h2: float
+    h3: float
+    beta: float  # deg
+
+    # Materials
+    g_s: float   # soil pcf
+    g_l: float   # LCC pcf
+    g_p: float   # pavement pcf
+    phi: float   # deg
+    c_prime: float  # psf
+
+    # Loads
+    T_l: float   # traffic psf
+
+    # Seismic
+    kh: float    # horizontal pseudo-static coefficient
+
+    # Inclusion flags
+    include_pavement_static: bool = True
+    include_traffic_static: bool = True
+    include_pavement_ps: bool = True
+    include_traffic_ps: bool = False
+
+    # Alpha scan
+    alpha_min: float = 15.0
+    alpha_max: float = 75.0
+    alpha_da: float  = 0.5
+
+    @property
+    def H(self) -> float:
+        return self.h1 + self.h2
+
+# -------------------------
+# Case A builders & evaluators
+# -------------------------
+
+def _caseA_build(alpha_deg: float, inp: Inputs) -> Optional[Dict]:
+    a = rad(alpha_deg); b = rad(inp.beta)
+    tanA, tanB = math.tan(a), math.tan(b)
+    # Skip singular configuration (alpha == beta)
+    if abs(tanA - tanB) < 1e-12:
+        return None
+
+    H = inp.H
+    h_soil = inp.h1 * tanA / (tanA - tanB)
+    h_BC   = H - h_soil
+    L2     = h_soil * cot(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    L1     = h_BC   * cot(b) if abs(math.sin(b)) > 1e-15 else 0.0
+
+    # Wedge 2 (A-frame) exact centroids
+    V_soil2 = 0.5 * inp.h1 * L2
+    xS2     = L2 / 3.0
+    zS2     = (inp.h1 + h_soil) / 3.0
+
+    V_LCC2  = L2 * (H - (inp.h1 + h_soil) / 2.0)
+    denx    = 3.0 * (2.0*H - inp.h1 - h_soil)
+    xL2     = L2 * (3.0*H - inp.h1 - 2.0*h_soil) / denx if abs(denx) > 1e-15 else 0.0
+    denz    = (2.0*H - inp.h1 - h_soil)
+    zL2     = (H*H - (h_soil*h_soil + inp.h1*inp.h1 + inp.h1*h_soil) / 3.0) / denz if abs(denz) > 1e-15 else 0.0
+
+    # Wedge 1 (B-frame) triangle
+    V_LCC1  = 0.5 * L1 * h_BC
+    xL1     = L2 + L1 / 3.0
+    zL1     = h_soil + 2.0 * h_BC / 3.0
+
+    # Weights and strips
+    W_soil2 = inp.g_s * V_soil2
+    W_LCC2  = inp.g_l * V_LCC2
+    W2_body = W_soil2 + W_LCC2
+    Wp2     = inp.g_p * inp.h3 * L2
+    Wt2     = inp.T_l * L2
+    W2_static = W2_body \
+              + (Wp2 if inp.include_pavement_static else 0.0) \
+              + (Wt2 if inp.include_traffic_static  else 0.0)
+
+    W_LCC1  = inp.g_l * V_LCC1
+    Wp1     = inp.g_p * inp.h3 * L1
+    Wt1     = inp.T_l * L1
+    W1_static = W_LCC1 \
+              + (Wp1 if inp.include_pavement_static else 0.0) \
+              + (Wt1 if inp.include_traffic_static  else 0.0)
+
+    # Contacts
+    L_AB = h_soil / math.sin(a) if abs(math.sin(a)) > 1e-15 else 0.0
+    L_BO = L1     / math.cos(b) if abs(math.cos(b)) > 1e-15 else 0.0
+
+    return dict(alpha=alpha_deg, a=a, b=b, H=H,
+                h_soil=h_soil, h_BC=h_BC, L1=L1, L2=L2,
+                V_soil2=V_soil2, xS2=xS2, zS2=zS2,
+                V_LCC2=V_LCC2,  xL2=xL2, zL2=zL2,
+                V_LCC1=V_LCC1,  xL1=xL1, zL1=zL1,
+                W_soil2=W_soil2, W_LCC2=W_LCC2, W2_body=W2_body,
+                Wp2=Wp2, Wt2=Wt2, W2_static=W2_static,
+                W_LCC1=W_LCC1, Wp1=Wp1, Wt1=Wt1, W1_static=W1_static,
+                L_AB=L_AB, L_BO=L_BO)
+
+def caseA_static(alpha_deg: float, inp: Inputs) -> Optional[Dict]:
+    D = _caseA_build(alpha_deg, inp)
+    if D is None:
+        return None
+    a = D['a']
+
+    # Stage 1 (Wedge 1 only)
+    P1 = thrust_eq21(inp.beta, D['W1_static'], inp.phi, 0.0, inp.c_prime, D['L_BO'])
+    include1 = (P1 > 0.0)
+    if include1:
+        M_W1 = D['W_LCC1']*(D['L1']/3.0) + D['Wp1']*(D['L1']/2.0) + D['Wt1']*(D['L1']/2.0)
+        W1s  = D['W_LCC1'] + D['Wp1'] + D['Wt1']
+        e1_B = M_W1 / W1s if W1s > 0 else 0.0
+        g1   = e1_B / math.cos(D['b']) if abs(math.cos(D['b'])) > 1e-15 else 0.0
+        N1_st = W1s*math.cos(D['b']) + P1*math.sin(D['b'])
+        z_p1  = (g1*N1_st - M_W1)/P1 if abs(P1) > 1e-12 else 0.0
+        M_1   = P1 * (z_p1 + D['h_soil'])
+    else:
+        z_p1  = 0.0
+        M_1   = 0.0
+
+    # Stage 2 (Wedge 2 only)
+    P2 = thrust_eq21(alpha_deg, D['W2_static'], inp.phi, 0.0, inp.c_prime, D['L_AB'])
+    e2_tot = (D['W_soil2']*D['xS2'] + D['W_LCC2']*D['xL2']
+              + D['Wp2']*(D['L2']/2.0) + D['Wt2']*(D['L2']/2.0)) / D['W2_static'] if D['W2_static']>0 else 0.0
+    g_st = e2_tot / math.cos(a) if abs(math.cos(a)) > 1e-15 else 0.0
+
+    # Wedge-2-only normal (static)
+    N_st = D['W2_static'] * math.cos(a) + P2 * math.sin(a)
+
+    # Stage 3 (global)
+    P_A = P2 + (P1 if include1 else 0.0)
+    h_st = (g_st * N_st - D['W2_static'] * e2_tot + M_1) / P_A if abs(P_A) > 1e-12 else 0.0
+
+    return dict(alpha=alpha_deg, case="A", P_A=P_A, h_st=h_st,
+                N_st=N_st, g_st=g_st, e2_tot=e2_tot, M1=M_1,
+                P1=P1, P2=P2)
+
+def caseA_pseudostatic(alpha_deg: float, inp: Inputs) -> Optional[Dict]:
+    D = _caseA_build(alpha_deg, inp)
+    if D is None:
+        return None
+    a = D['a']
+
+    # Pseudo-static weights
+    W2_ps = D['W2_body'] \
+          + (D['Wp2'] if inp.include_pavement_ps else 0.0) \
+          + (D['Wt2'] if inp.include_traffic_ps  else 0.0)
+
+    # Composite centroid including pavement if present
+    x2_body = (D['W_soil2']*D['xS2'] + D['W_LCC2']*D['xL2'])/D['W2_body'] if D['W2_body']>0 else 0.0
+    z2_body = (D['W_soil2']*D['zS2'] + D['W_LCC2']*D['zL2'])/D['W2_body'] if D['W2_body']>0 else 0.0
+
+    x2_ps = (D['W2_body'] * x2_body
+             + (D['Wp2'] if inp.include_pavement_ps else 0.0) * (D['L2']/2.0)
+             + (D['Wt2'] if inp.include_traffic_ps  else 0.0) * (D['L2']/2.0)) / W2_ps if W2_ps>0 else 0.0
+
+    z2_ps = (D['W2_body'] * z2_body
+             + (D['Wp2'] if inp.include_pavement_ps else 0.0) * (inp.H + inp.h3/2.0)
+             + (D['Wt2'] if inp.include_traffic_ps  else 0.0) * (inp.H)) / W2_ps if W2_ps>0 else 0.0
+
+    # Per-wedge ps thrusts
+    P2E = thrust_eq21(alpha_deg, W2_ps, inp.phi, inp.kh, inp.c_prime, D['L_AB'])
+
+    # Wedge-2-only ps normal
+    g_ps = x2_ps / math.cos(a) if abs(math.cos(a)) > 1e-15 else 0.0
+    N_ps = W2_ps * math.cos(a) - inp.kh * W2_ps * math.sin(a) + P2E * math.sin(a)
+
+    # Global ps thrust (W1 ps contribution gated by sign; here not blended into normals/levers)
+    P1E = 0.0  # If you later include W1 ps, compute it and gate it here.
+    P_AE = P2E + (P1E if P1E > 0.0 else 0.0)
+
+    sum_eW  = W2_ps * x2_ps
+    sum_zkW = inp.kh * W2_ps * z2_ps
+    h_ps = (g_ps * N_ps - sum_eW + sum_zkW) / P_AE if abs(P_AE) > 1e-12 else 0.0
+
+    return dict(alpha=alpha_deg, case="A", P_AE=P_AE, h_ps=h_ps,
+                N_ps=N_ps, g_ps=g_ps, x2_ps=x2_ps, z2_ps=z2_ps,
+                P2E=P2E)
+
+# -------------------------
+# Case B builders & evaluators (legacy single wedge)
+# -------------------------
+
+def _caseB_build(alpha_deg: float, inp: Inputs) -> Optional[Dict]:
+    a = rad(alpha_deg); b = rad(inp.beta)
+    if abs(math.sin(a)) < 1e-15:
+        return None
+    H = inp.H
+    L2    = H * cot(a)
+    V_tot = 0.5 * H * H * cot(a)
+    V_LCC = 0.5 * inp.h2 * inp.h2 * cot(b)
+    V_soil= V_tot - V_LCC
+
+    W_LCC = inp.g_l * V_LCC
+    W_soil= inp.g_s * V_soil
+    W_body= W_LCC + W_soil
+
+    x_LCC = (1.0/3.0) * inp.h2 * cot(b)
+    z_LCC = inp.h1 + (2.0/3.0) * inp.h2
+
+    num_x = (H**3)*(cot(a)**2) - (inp.h2**3)*(cot(b)**2)
+    den   = 3.0 * ((H**2)*cot(a) - (inp.h2**2)*cot(b))
+    x_soil= num_x / den if abs(den) > 1e-15 else 0.0
+
+    num_z = 2.0*(H**3)*cot(a) - (inp.h2**2)*cot(b)*(3.0*inp.h1 + 2.0*inp.h2)
+    z_soil= num_z / den if abs(den) > 1e-15 else 0.0
+
+    Wp    = inp.g_p * inp.h3 * L2
+    Wt    = inp.T_l * L2
+
+    W_static = W_body \
+             + (Wp if inp.include_pavement_static else 0.0) \
+             + (Wt if inp.include_traffic_static  else 0.0)
+
+    W_ps = W_body \
+         + (Wp if inp.include_pavement_ps else 0.0) \
+         + (Wt if inp.include_traffic_ps  else 0.0)
+
+    L_AB = H / math.sin(a)
+
+    return dict(alpha=alpha_deg, a=a, b=b, H=H,
+                L2=L2, V_tot=V_tot, V_LCC=V_LCC, V_soil=V_soil,
+                W_LCC=W_LCC, W_soil=W_soil, W_body=W_body,
+                x_LCC=x_LCC, z_LCC=z_LCC, x_soil=x_soil, z_soil=z_soil,
+                Wp=Wp, Wt=Wt, W_static=W_static, W_ps=W_ps, L_AB=L_AB)
+
+
+
+def caseB_pseudostatic(alpha_deg: float, inp: Inputs) -> Optional[Dict]:
+    B = _caseB_build(alpha_deg, inp)
+    if B is None:
+        return None
+
+    # Pseudo-static thrust (uses W_ps)
+    P_AE = thrust_eq21(alpha_deg, B['W_ps'], inp.phi, inp.kh, inp.c_prime, B['L_AB'])
+
+    # Pseudo-static centroid (soil + LCC + pavement only)
+    x_ps = (
+        B['W_soil'] * B['x_soil']
+        + B['W_LCC'] * B['x_LCC']
+        + (B['Wp'] if inp.include_pavement_ps else 0.0) * (B['L2'] / 2.0)
+    ) / B['W_ps']
+
+    z_ps = (
+        B['W_soil'] * B['z_soil']
+        + B['W_LCC'] * B['z_LCC']
+        + (B['Wp'] if inp.include_pavement_ps else 0.0) * (inp.H + inp.h3 / 2.0)
+    ) / B['W_ps']
+
+    g_ps = x_ps / math.cos(B['a'])
+
+    # IMPORTANT CORRECTION: use W_ps (not W_body)
+    N_ps = (
+        B['W_ps'] * math.cos(B['a'])
+        - inp.kh * B['W_ps'] * math.sin(B['a'])
+        + P_AE * math.sin(B['a'])
+    )
+
+    h_ps = (
+        g_ps * N_ps
+        - B['W_ps'] * x_ps
+        + inp.kh * B['W_ps'] * z_ps
+    ) / P_AE
+
+    return {
+        "case": "B",
+        "alpha": alpha_deg,
+        "P_AE": P_AE,
+        "h_ps": h_ps,
+        "N_ps": N_ps,
+        "g_ps": g_ps,
+        "x_ps": x_ps,
+        "z_ps": z_ps
+    }
+
+# -------------------------
+# Scanners & Governing Selectors
+# -------------------------
+
+def evaluate_governing(inp: Inputs) -> Dict:
+    """
+    Scans alpha:
+      - Case A over [alpha_crit .. alpha_max]
+      - Case B over [alpha_min  .. alpha_crit]
+    Returns governing (max) for static and pseudo-static across both cases.
+    """
+    acrit = alpha_crit(inp.beta, inp.H, inp.h2)
+
+    static_records = []
+    pseudo_records = []
+
+    # CASE A ranges
+    a = max(inp.alpha_min, acrit + 1e-6)
+    while a <= inp.alpha_max + 1e-9:
+        rA = caseA_static(a, inp)
+        if rA: static_records.append(rA)
+        rAp = caseA_pseudostatic(a, inp)
+        if rAp: pseudo_records.append(rAp)
+        a += inp.alpha_da
+
+    # CASE B ranges
+    a = inp.alpha_min
+    while a <= min(inp.alpha_max, acrit) + 1e-9:
+        rB = caseB_static(a, inp)
+        if rB: static_records.append(rB)
+        rBp = caseB_pseudostatic(a, inp)
+        if rBp: pseudo_records.append(rBp)
+        a += inp.alpha_da
+
+    gov_static = max(static_records, key=lambda r: r["P_A"])
+    gov_pseudo = max(pseudo_records, key=lambda r: r["P_AE"])
+
+    return {
+        "alpha_crit": acrit,
+        "static_governing": gov_static,
+        "pseudo_governing": gov_pseudo,
+        "all_static": static_records,
+        "all_pseudo": pseudo_records
+    }
+
+# -------------------------
+# Example main
+# -------------------------
+
+if __name__ == "__main__":
+    # Example: replace with your inputs (these match today's request)
+    inp = Inputs(
+        h1=3.0, h2=25.0, h3=2.0,
+        beta=45.0,
+        g_s=120.0, g_l=40.0, g_p=150.0,
+        T_l=240.0,
+        phi=34.0, c_prime=0.0, kh=0.16,
+        include_pavement_static=True, include_traffic_static=True,
+        include_pavement_ps=True,     include_traffic_ps=False,
+        alpha_min=15.0, alpha_max=75.0, alpha_da=0.5
+    )
+
+    res = evaluate_governing(inp)
+    acrit = res["alpha_crit"]
+    s = res["static_governing"]
+    p = res["pseudo_governing"]
+
+    print(f"alpha_crit = {acrit:.6f}°")
+    print("\nSTATIC – Governing across Case A & B")
+    print("-----------------------------------")
+    print(f"Case  : {s['case']} at alpha={s['alpha']:.3f}°")
+    print(f"P_A   : {s['P_A']:.3f} lb/ft")
+    print(f"h_st  : {s['h_st']:.3f} ft")
+    if s["case"] == "A":
+        print(f"N_st  : {s['N_st']:.3f} lb/ft; g_st={s['g_st']:.3f} ft; e2_tot={s['e2_tot']:.3f} ft; M1={s['M1']:.3f} ft-lb/ft")
+
+    print("\nPSEUDO-STATIC – Governing across Case A & B")
+    print("-------------------------------------------")
+    print(f"Case  : {p['case']} at alpha={p['alpha']:.3f}°")
+    print(f"P_AE  : {p['P_AE']:.3f} lb/ft")
+    print(f"h_ps  : {p['h_ps']:.3f} ft")
+    if p["case"] == "A":
+        print(f"N_ps  : {p['N_ps']:.3f} lb/ft; g_ps={p['g_ps']:.3f} ft; x2_ps={p['x2_ps']:.3f} ft; z2_ps={p['z2_ps']:.3f} ft")
+    if p["case"] == "B":
+        print(f"N_ps  : {p['N_ps']:.3f} lb/ft; g_ps={p['g_ps']:.3f} ft; x_body={p['x_body']:.3f} ft; z_body={p['z_body']:.3f} ft")
