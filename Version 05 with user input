@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+# ======================================================================
+# wedge_single_2026-01-29_V.05.py
+# Version: 2026-01-29 V.05 (standalone, user-prompted)
+# Purpose:
+#   Run a single scenario (custom inputs) for static & pseudo-static thrusts
+#   with Case A and Case B, including V.04 pseudo-static rules and
+#   local α_crit refinement. Produces governing selections and (optionally)
+#   CSV/LaTeX outputs.
+#
+# Refer to Supplemental Material for explanation of notation.
+# Example how to run code with user-input parameters
+# python wedge_single_2026-01-29_V.05.py \
+#  --no-prompt --h1 3 --h2 25 --h3 2 --gam-soil 120 --gam-lcc 40 --gam-pave 150 \
+#  --surch 240 --KH 0.16 --beta 45 --phi 34 --cprime 100 --json run_log.json
+# Author: Mazen Adib 
+# ======================================================================
+
+import math
+import argparse
+import json
+import sys
+from datetime import datetime
+
+# ------------- Helpers -------------------------------------------------
+rad = math.radians
+
+def ffloat(x, name):
+    try:
+        return float(x)
+    except Exception:
+        raise ValueError(f"Invalid numeric value for {name}: {x}")
+
+def prompt_float(prompt, default=None):
+    s = input(f"{prompt}" + (f" [{default}]" if default is not None else "") + ": ").strip()
+    if not s and default is not None:
+        return default
+    return ffloat(s, prompt)
+
+# ------------- Core Mechanics ------------------------------------------
+def thrust_P(W, theta_deg, phi_deg, c_prime, Lc, kh_val):
+    """
+    P = [ W*((sinθ - cosθ*tanφ) + kh*(cosθ + sinθ*tanφ)) - c' * Lc ] / (cosθ + sinθ*tanφ)
+    θ = plane angle (α for wedge-2, β for wedge-1); φ in degrees
+    """
+    s = math.sin(rad(theta_deg)); c = math.cos(rad(theta_deg)); tphi = math.tan(rad(phi_deg))
+    den = (c + s * tphi)
+    if abs(den) < 1e-12:
+        den = 1e-12
+    return (W * ((s - c * tphi) + kh_val * (c + s * tphi)) - c_prime * Lc) / den
+
+def caseA_geometry(alpha, beta, h1, h2):
+    ta = math.tan(rad(alpha)); tb = math.tan(rad(beta))
+    H  = h1 + h2
+    if abs(ta - tb) < 1e-12:
+        ta += 1e-12
+    h_soil = h1 * ta / (ta - tb)
+    h_BC   = H - h_soil
+    L1     = h_BC / math.tan(rad(beta))
+    LBO    = L1 / math.cos(rad(beta))
+    L2     = h2 / math.tan(rad(beta)) - L1
+    LAB    = h_soil / math.sin(rad(alpha))
+    return H, h_soil, h_BC, L1, LBO, L2, LAB
+
+def wedge2_caseA_areas_centroids(alpha, beta, h1, h2):
+    H, h_soil, h_BC, L1, LBO, L2, LAB = caseA_geometry(alpha, beta, h1, h2)
+    V_soil2 = 0.5 * h1 * L2
+    x_S2 = L2 / 3.0
+    z_S2 = (h1 + h_soil) / 3.0
+    V_LCC2 = L2 * (H - 0.5 * (h1 + h_soil))
+    denom = (2*H - h1 - h_soil)
+    if abs(denom) < 1e-12:
+        x_L2 = L2 / 2.0
+        z_L2 = (H + h1) / 2.0
+    else:
+        x_L2 = L2 * (3*H - h1 - 2*h_soil) / (3 * denom)
+        z_L2 = (H*H - (h_soil*h_soil + h1*h1 + h1*h_soil)/3.0) / denom
+    return dict(H=H, h_soil=h_soil, h_BC=h_BC, L1=L1, LBO=LBO, L2=L2, LAB=LAB,
+                V_soil2=V_soil2, x_S2=x_S2, z_S2=z_S2, V_LCC2=V_LCC2, x_L2=x_L2, z_L2=z_L2)
+
+def caseB_geometry(alpha, beta, h1, h2):
+    H = h1 + h2
+    L2 = H / math.tan(rad(alpha))
+    LAB = H / math.sin(rad(alpha))
+    V_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    V_tot = 0.5 * H * H / math.tan(rad(alpha))
+    V_soil = V_tot - V_LCC
+    return H, L2, LAB, V_LCC, V_soil
+
+# ---------------- V.04 pseudo-static rules (Case A) --------------------
+def evaluate_caseA_at_alpha_V05(alpha, beta, phi, c_prime, h1, h2,
+                                h3, gam_soil, gam_lcc, gam_pave, surch, KH):
+    # Geom & areas
+    g = wedge2_caseA_areas_centroids(alpha, beta, h1, h2)
+
+    # Wedge 2 masses
+    W_soil2 = gam_soil * g['V_soil2']
+    W_LCC2  = gam_lcc  * g['V_LCC2']
+    Wp2     = gam_pave * h3 * g['L2']
+    Wt2     = surch    * g['L2']   # surcharge only in static
+
+    W2_body = W_soil2 + W_LCC2
+    W2_st   = W2_body + Wp2 + Wt2
+    W2_ps   = W2_body + Wp2        # ps excludes surcharge
+
+    # ps centroid arms
+    x2_ps = (W2_body*((W_soil2*g['x_S2'] + W_LCC2*g['x_L2'])/(W2_body if W2_body else 1))
+             + Wp2*(g['L2']/2.0)) / (W2_ps if W2_ps else 1)
+    z2_ps = (W2_body*((W_soil2*g['z_S2'] + W_LCC2*g['z_L2'])/(W2_body if W2_body else 1))
+             + Wp2*(g['H'] + h3/2.0)) / (W2_ps if W2_ps else 1)
+
+    # Wedge 1 masses
+    V_LCC1 = 0.5 * g['L1'] * g['h_BC']
+    W_LCC1 = gam_lcc * V_LCC1
+    Wp1    = gam_pave * h3 * g['L1']
+    Wt1    = surch    * g['L1']
+    W1_st  = W_LCC1 + Wp1 + Wt1
+    W1_ps  = W_LCC1 + Wp1
+
+    # Thrusts at same alpha
+    P1  = thrust_P(W1_st, beta,  phi, c_prime, g['LBO'], kh_val=0.0)
+    P1E = thrust_P(W1_ps, beta,  phi, c_prime, g['LBO'], kh_val=KH)
+    P2  = thrust_P(W2_st, alpha, phi, c_prime, g['LAB'], kh_val=0.0)
+    P2E = thrust_P(W2_ps, alpha, phi, c_prime, g['LAB'], kh_val=KH)
+
+    include1  = P1  > 0.0
+    include1E = P1E > 0.0
+
+    PA  = (P1  if include1  else 0.0) + P2
+    PAE = (P1E if include1E else 0.0) + P2E
+
+    # Static resultant height
+    N_st = W2_st * math.cos(rad(alpha)) + P2 * math.sin(rad(alpha))
+    x2_tot = (W_soil2*g['x_S2'] + W_LCC2*g['x_L2'] + Wp2*(g['L2']/2.0) + Wt2*(g['L2']/2.0)) / (W2_st if W2_st else 1)
+    gst   = x2_tot / math.cos(rad(alpha))
+    M1_st = 0.0
+    if include1 and P1 != 0.0:
+        e1B_st = (W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0) + Wt1*(g['L1']/2.0)) / (W1_st if W1_st else 1)
+        g1_st  = e1B_st / math.cos(rad(beta))
+        N1_st  = W1_st * math.cos(rad(beta)) + P1 * math.sin(rad(beta))
+        S1     = (W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0) + Wt1*(g['L1']/2.0))
+        zp1_st = (g1_st * N1_st - S1) / (P1 if P1 else 1)
+        M1_st  = P1 * (zp1_st + g['h_soil'])
+    h_st = (gst * N_st - W2_st * x2_tot + M1_st) / (PA if abs(PA) > 1e-12 else float('nan'))
+
+    # Pseudo-static resultant height (V.04 logic)
+    N_ps = W2_ps * math.cos(rad(alpha)) - KH * W2_ps * math.sin(rad(alpha)) + P2E * math.sin(rad(alpha))
+    z1B_ps = (W_LCC1*(g['h_BC']*2.0/3.0) + Wp1*(g['h_BC'] + h3/2.0)) / (W1_ps if W1_ps else 1)
+
+    if not include1E:
+        # Rule-2: exclude M1 from ps, but do NOT force h_ps=0
+        M1_ps = 0.0
+        gps   = x2_ps / math.cos(rad(alpha))
+        h_ps  = (gps * N_ps - W2_ps * x2_ps + KH * W2_ps * z2_ps + M1_ps) / (PAE if abs(PAE) > 1e-12 else float('nan'))
+    else:
+        if P1 < 0.0:
+            zp1_ps = z1B_ps
+        else:
+            S1 = W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0)
+            e1B_ps = S1 / (W1_ps if W1_ps else 1)
+            g1_ps  = e1B_ps / math.cos(rad(beta))
+            N1_ps  = W1_ps * math.cos(rad(beta)) - KH * W1_ps * math.sin(rad(beta)) + P1E * math.sin(rad(beta))
+            zp1_ps = (g1_ps * N1_ps - S1 + KH * W1_ps * z1B_ps) / (P1E if P1E else 1)
+            zp1_ps = max(0.0, min(zp1_ps, g['h_BC']))
+        M1_ps  = P1E * (zp1_ps + g['h_soil'])
+        gps    = x2_ps / math.cos(rad(alpha))
+        h_ps   = (gps * N_ps - W2_ps * x2_ps + KH * W2_ps * z2_ps + M1_ps) / (PAE if abs(PAE) > 1e-12 else float('nan'))
+
+    return dict(alpha=alpha, PA=PA, PAE=PAE, h_st=h_st, h_ps=h_ps)
+
+def evaluate_caseB_at_alpha(alpha, beta, phi, c_prime, h1, h2,
+                            h3, gam_soil, gam_lcc, gam_pave, surch, KH):
+    H, L2, LAB, V_LCC, V_soil = caseB_geometry(alpha, beta, h1, h2)
+    W_LCC = gam_lcc  * V_LCC
+    W_soil= gam_soil * V_soil
+    W_body= W_LCC + W_soil
+    Wp    = gam_pave * h3 * L2
+    Wt    = surch    * L2
+    W_st  = W_body + Wp + Wt
+    W_ps  = W_body + Wp
+
+    P_st  = thrust_P(W_st, alpha, phi, c_prime, LAB, kh_val=0.0)
+    P_ps  = thrust_P(W_ps, alpha, phi, c_prime, LAB, kh_val=KH)
+
+    # Centroids (strip subtraction)
+    x_tot = (h1 + h2) / math.tan(rad(alpha)) / 3.0; z_tot = 2*(h1+h2)/3.0
+    x_LCC = h2 / math.tan(rad(beta)) / 3.0;       z_LCC = h1 + 2*h2/3.0
+    A_tot = 0.5 * (h1+h2) * (h1+h2) / math.tan(rad(alpha))
+    A_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    A_soil= A_tot - A_LCC if A_tot - A_LCC != 0 else 1.0
+    x_soil= (A_tot * x_tot - A_LCC * x_LCC) / A_soil
+    z_soil= (A_tot * z_tot - A_LCC * z_LCC) / A_soil
+
+    e_tot = (W_body * ((W_soil * x_soil + W_LCC * x_LCC) / (W_body if W_body else 1))
+             + Wp * (L2/2.0) + Wt * (L2/2.0)) / (W_st if W_st else 1)
+    gst  = e_tot / math.cos(rad(alpha))
+    N_st = W_st  * math.cos(rad(alpha)) + P_st * math.sin(rad(alpha))
+    h_st = (gst * N_st - W_st * e_tot) / (P_st if abs(P_st) > 1e-12 else float('nan'))
+
+    x_body= (W_soil * x_soil + W_LCC * x_LCC) / (W_body if W_body else 1)
+    z_body= (W_soil * z_soil + W_LCC * z_LCC) / (W_body if W_body else 1)
+    x_ps  = (W_body * x_body + Wp * (L2/2.0)) / (W_ps if W_ps else 1)
+    z_ps  = (W_body * z_body + Wp * ((h1+h2) + h3/2.0)) / (W_ps if W_ps else 1)
+    gps   = x_ps / math.cos(rad(alpha))
+    N_ps  = W_ps * math.cos(rad(alpha)) - KH * W_ps * math.sin(rad(alpha)) + P_ps * math.sin(rad(alpha))
+    h_ps  = (gps * N_ps - W_ps * x_ps + KH * W_ps * z_ps) / (P_ps if abs(P_ps) > 1e-12 else float('nan'))
+
+    return dict(alpha=alpha, PA=P_st, PAE=P_ps, h_st=h_st, h_ps=h_ps)
+
+def run_scan_single(beta, phi, c_prime, h1, h2, h3, gam_soil, gam_lcc, gam_pave, surch, KH,
+                    amin=15.0, amax=75.0, coarse_step=0.5, refine_band=0.5, refine_step=0.02):
+    H = h1 + h2
+    alpha_crit = math.degrees(math.atan((H * math.tan(rad(beta))) / h2))
+
+    # Coarse grid
+    alphas = [amin + i*coarse_step for i in range(int((amax - amin)/coarse_step) + 1)]
+
+    # Refinement around alpha_crit and include exact alpha_crit
+    a_lo = max(amin, alpha_crit - refine_band)
+    a_hi = min(amax, alpha_crit + refine_band)
+    n_ref = int(round((a_hi - a_lo)/refine_step))
+    fine  = [a_lo + i*refine_step for i in range(n_ref + 1)]
+    fine.append(alpha_crit)
+
+    all_alphas = sorted(set([round(a,6) for a in (alphas + fine)]))
+
+    A_list, B_list = [], []
+    for a in all_alphas:
+        if a > alpha_crit:
+            A_list.append(evaluate_caseA_at_alpha_V05(a, beta, phi, c_prime, h1, h2, h3, gam_soil, gam_lcc, gam_pave, surch, KH))
+        else:
+            B_list.append(evaluate_caseB_at_alpha(a, beta, phi, c_prime, h1, h2, h3, gam_soil, gam_lcc, gam_pave, surch, KH))
+
+    def pick_max_pos(lst, key):
+        pos = [d for d in lst if d[key] is not None and d[key] > 0]
+        return max(pos, key=lambda d: d[key]) if pos else None
+
+    return dict(alpha_crit=alpha_crit,
+                A_st=pick_max_pos(A_list, 'PA'),
+                A_ps=pick_max_pos(A_list, 'PAE'),
+                B_st=pick_max_pos(B_list, 'PA'),
+                B_ps=pick_max_pos(B_list, 'PAE'))
+
+# ------------- UI / CLI -----------------------------------------------
+def build_parser():
+    p = argparse.ArgumentParser(description="V.05 single-scenario wedge solver (static & pseudo-static) with α_crit refinement.")
+    p.add_argument("--no-prompt", action="store_true", help="Run non-interactively (use flags or defaults).")
+    # geometry
+    p.add_argument("--h1", type=float, default=None, help="Height of soil above toe h1 [ft].")
+    p.add_argument("--h2", type=float, default=None, help="Thickness of LCC above toe h2 [ft].")
+    p.add_argument("--h3", type=float, default=None, help="Thickness of pavement h3 [ft].")
+    # materials
+    p.add_argument("--gam-soil", type=float, default=None, help="Unit weight of soil γ_s [pcf].")
+    p.add_argument("--gam-lcc",  type=float, default=None, help="Unit weight of LCC γ_LCC [pcf].")
+    p.add_argument("--gam-pave", type=float, default=None, help="Unit weight of pavement γ_p [pcf].")
+    p.add_argument("--surch",    type=float, default=None, help="Uniform surcharge q [psf].")
+    # seismic / strength
+    p.add_argument("--KH",   type=float, default=None, help="Pseudo-static horizontal coefficient K_H [-].")
+    p.add_argument("--beta", type=float, default=None, help="Interface angle β [deg].")
+    p.add_argument("--phi",  type=float, default=None, help="Friction angle φ [deg].")
+    p.add_argument("--cprime", type=float, default=None, help="Cohesion c' [psf].")
+    # scan & refinement
+    p.add_argument("--amin", type=float, default=15.0, help="Min α for scan [deg].")
+    p.add_argument("--amax", type=float, default=75.0, help="Max α for scan [deg].")
+    p.add_argument("--dalpha", type=float, default=0.5,  help="Coarse step [deg].")
+    p.add_argument("--refine-band", type=float, default=0.5, help="± band around α_crit for refinement [deg].")
+    p.add_argument("--refine-step", type=float, default=0.02, help="Refined step [deg].")
+    # outputs
+    p.add_argument("--json",  type=str, default=None, help="Write JSON log to file.")
+    return p
+
+def get_inputs(args):
+    # Defaults aligned with your 27-case style (soil/LCC/pave/surcharge/KH)
+    defaults = dict(
+        h1=3.0, h2=25.0, h3=2.0,
+        gam_soil=120.0, gam_lcc=40.0, gam_pave=150.0,
+        surch=240.0,
+        KH=0.16,
+        beta=45.0, phi=34.0, cprime=0.0
+    )
+    if args.no_prompt:
+        vals = dict(
+            h1 = defaults['h1'] if args.h1 is None else args.h1,
+            h2 = defaults['h2'] if args.h2 is None else args.h2,
+            h3 = defaults['h3'] if args.h3 is None else args.h3,
+            gam_soil = defaults['gam_soil'] if args.gam_soil is None else args.gam_soil,
+            gam_lcc  = defaults['gam_lcc']  if args.gam_lcc  is None else args.gam_lcc,
+            gam_pave = defaults['gam_pave'] if args.gam_pave is None else args.gam_pave,
+            surch    = defaults['surch']    if args.surch    is None else args.surch,
+            KH       = defaults['KH']       if args.KH       is None else args.KH,
+            beta     = defaults['beta']     if args.beta     is None else args.beta,
+            phi      = defaults['phi']      if args.phi      is None else args.phi,
+            cprime   = defaults['cprime']   if args.cprime   is None else args.cprime,
+            amin     = args.amin, amax=args.amax, dalpha=args.dalpha,
+            refine_band=args.refine_band, refine_step=args.refine_step
+        )
+        return vals
+
+    print("\n--- V.05 Single-Scenario Input (units: ft, pcf, psf, deg) ---")
+    h1 = prompt_float("Enter height of soil above toe h_1", defaults['h1'])
+    h2 = prompt_float("Enter thickness of LCC above toe h_2", defaults['h2'])
+    h3 = prompt_float("Enter thickness of pavement h_3", defaults['h3'])
+
+    gam_soil = prompt_float("Enter unit weight of soil γ_s (pcf)", defaults['gam_soil'])
+    gam_lcc  = prompt_float("Enter unit weight of LCC γ_LCC (pcf)", defaults['gam_lcc'])
+    gam_pave = prompt_float("Enter unit weight of pavement γ_p (pcf)", defaults['gam_pave'])
+    surch    = prompt_float("Enter uniform surcharge q (psf) [static only]", defaults['surch'])
+
+    KH   = prompt_float("Enter pseudo-static horizontal coefficient K_H", defaults['KH'])
+    beta = prompt_float("Enter interface angle β (deg)", defaults['beta'])
+    phi  = prompt_float("Enter friction angle φ (deg)", defaults['phi'])
+    cpr  = prompt_float("Enter cohesion c' (psf)", defaults['cprime'])
+
+    print("\n--- Scan Settings ---")
+    amin = prompt_float("Enter α_min (deg)", 15.0)
+    amax = prompt_float("Enter α_max (deg)", 75.0)
+    dal  = prompt_float("Enter coarse step Δα (deg)", 0.5)
+    rband= prompt_float("Enter refinement band around α_crit (±deg)", 0.5)
+    rstep= prompt_float("Enter refinement step (deg)", 0.02)
+
+    return dict(h1=h1, h2=h2, h3=h3, gam_soil=gam_soil, gam_lcc=gam_lcc,
+                gam_pave=gam_pave, surch=surch, KH=KH, beta=beta, phi=phi,
+                cprime=cpr, amin=amin, amax=amax, dalpha=dal,
+                refine_band=rband, refine_step=rstep)
+
+def main():
+    parser = build_parser()
+    args   = parser.parse_args()
+
+    vals = get_inputs(args)
+    H = vals['h1'] + vals['h2']
+    alpha_crit = math.degrees(math.atan((H*math.tan(rad(vals['beta'])))/vals['h2']))
+
+    res = run_scan_single(vals['beta'], vals['phi'], vals['cprime'],
+                          vals['h1'], vals['h2'], vals['h3'],
+                          vals['gam_soil'], vals['gam_lcc'], vals['gam_pave'],
+                          vals['surch'], vals['KH'],
+                          amin=vals['amin'], amax=vals['amax'],
+                          coarse_step=vals['dalpha'],
+                          refine_band=vals['refine_band'],
+                          refine_step=vals['refine_step'])
+
+    print("\n=== V.05 Results (single scenario) ===")
+    print(f"Date/UTC: {datetime.utcnow().isoformat()}Z")
+    print(f"Inputs: h1={vals['h1']:.3f} ft, h2={vals['h2']:.3f} ft, h3={vals['h3']:.3f} ft, "
+          f"γ_s={vals['gam_soil']:.1f} pcf, γ_LCC={vals['gam_lcc']:.1f} pcf, γ_p={vals['gam_pave']:.1f} pcf, "
+          f"q={vals['surch']:.1f} psf, K_H={vals['KH']:.3f}, β={vals['beta']:.3f}°, φ={vals['phi']:.3f}°, c'={vals['cprime']:.1f} psf")
+    print(f"Scan: α∈[{vals['amin']:.2f},{vals['amax']:.2f}]°, Δα={vals['dalpha']:.3f}°; "
+          f"refine ±{vals['refine_band']:.2f}° @ {vals['refine_step']:.3f}° around α_crit")
+    print(f"α_crit = {alpha_crit:.4f}°\n")
+
+    def show(tag, d):
+        if d:
+            print(f"{tag}: α*={d['alpha']:.4f}°, P={d['PA'] if 'PA' in d else d['PAE']:.2f} lb/ft, "
+                  f"h={'{:.2f}'.format(d['h_st']) if 'h_st' in d else '{:.2f}'.format(d['h_ps'])} ft")
+        else:
+            print(f"{tag}: -")
+
+    print("Case A (static):", end=" ")
+    show("", res['A_st'])
+    print("Case A (pseudo-static):", end=" ")
+    show("", res['A_ps'])
+    print("Case B (static):", end=" ")
+    show("", res['B_st'])
+    print("Case B (pseudo-static):", end=" ")
+    show("", res['B_ps'])
+
+    # Governing picks
+    def pick_gov(staticA, staticB, keyP, keyH):
+        cand = [d for d in (staticA, staticB) if d and d[keyP] > 0]
+        if cand:
+            best = max(cand, key=lambda d: d[keyP])
+            return best
+        return None
+
+    gov_st = pick_gov(res['A_st'], res['B_st'], 'PA', 'h_st')
+    gov_ps = pick_gov(res['A_ps'], res['B_ps'], 'PAE', 'h_ps')
+
+    print("\n-- Governing --")
+    if gov_st:
+        reg = "A" if gov_st in (res['A_st'],) else "B"
+        print(f"Static:   Reg {reg}, α*={gov_st['alpha']:.4f}°, P_A={gov_st['PA']:.2f} lb/ft, h_s={gov_st['h_st']:.2f} ft")
+    else:
+        print("Static:   (none > 0)")
+
+    if gov_ps:
+        reg = "A" if gov_ps in (res['A_ps'],) else "B"
+        print(f"Pseudo-static: Reg {reg}, α*={gov_ps['alpha']:.4f}°, P_AE={gov_ps['PAE']:.2f} lb/ft, h_ps={gov_ps['h_ps']:.2f} ft")
+    else:
+        print("Pseudo-static: (none > 0)")
+
+    # Optional JSON
+    if args.json:
+        out = dict(meta=dict(version="2026-01-29 V.05", timestamp=datetime.utcnow().isoformat()+"Z"),
+                   inputs=vals, alpha_crit=alpha_crit, results=res,
+                   governing=dict(static=gov_st, pseudo_static=gov_ps))
+        with open(args.json, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nWrote JSON log: {args.json}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(1)
