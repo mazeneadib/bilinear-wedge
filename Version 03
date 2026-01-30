@@ -1,0 +1,359 @@
+# ======================================================================
+# wedge_table27_2026-01-29_V.03.py
+# Version: 2026-01-29 V.03
+# Purpose: Generate 27-case tables (static & pseudo-static) for Stage-3
+#          with revised pseudo-static M1 logic (Case A, Wedge 1) and
+#          updated beta values (replace 25.6° by 26.57° where noted).
+# Author : Mazen Adib (engineering)
+# ======================================================================
+
+import math
+import pandas as pd
+from datetime import datetime
+
+VERSION   = "2026-01-29 V.03"
+TIMESTAMP = datetime.utcnow().isoformat() + "Z"
+rad       = math.radians
+
+# ----- Constants (per problem statement) -----
+h1 = 3.0   # ft
+h3 = 2.0   # ft
+GAM_SOIL = 120.0  # pcf
+GAM_LCC  = 40.0   # pcf
+GAM_PAVE = 150.0  # pcf
+SURCH    = 240.0  # psf (traffic surcharge)
+KH       = 0.16   # pseudo-static horizontal coefficient
+
+# ---------- Geometry (Case A) ----------
+def caseA_geometry(alpha, beta, h2):
+    ta = math.tan(rad(alpha)); tb = math.tan(rad(beta))
+    H  = h1 + h2
+    if abs(ta - tb) < 1e-12:
+        ta += 1e-12
+    h_soil = h1 * ta / (ta - tb)
+    h_BC   = H - h_soil
+    L1     = h_BC / math.tan(rad(beta))
+    LBO    = L1 / math.cos(rad(beta))
+    L2     = h2 / math.tan(rad(beta)) - L1
+    LAB    = h_soil / math.sin(rad(alpha))
+    return H, h_soil, h_BC, L1, LBO, L2, LAB
+
+def wedge2_caseA_areas_centroids(alpha, beta, h2):
+    H, h_soil, h_BC, L1, LBO, L2, LAB = caseA_geometry(alpha, beta, h2)
+    # Wedge 2 “soil” triangular part below h1 (width L2, height h1)
+    V_soil2 = 0.5 * h1 * L2
+    x_S2 = L2 / 3.0
+    z_S2 = (h1 + h_soil) / 3.0
+    # Wedge 2 LCC rectangular part above (approximate strip)
+    V_LCC2 = L2 * (H - 0.5 * (h1 + h_soil))
+    denom = (2*H - h1 - h_soil)
+    if abs(denom) < 1e-12:
+        x_L2 = L2 / 2.0
+        z_L2 = (H + h1) / 2.0
+    else:
+        x_L2 = L2 * (3*H - h1 - 2*h_soil) / (3 * denom)
+        z_L2 = (H*H - (h_soil*h_soil + h1*h1 + h1*h_soil)/3.0) / denom
+    return dict(H=H, h_soil=h_soil, h_BC=h_BC, L1=L1, LBO=LBO, L2=L2, LAB=LAB,
+                V_soil2=V_soil2, x_S2=x_S2, z_S2=z_S2, V_LCC2=V_LCC2, x_L2=x_L2, z_L2=z_L2)
+
+# ---------- Geometry (Case B) ----------
+def caseB_geometry(alpha, beta, h2):
+    H = h1 + h2
+    L2 = H / math.tan(rad(alpha))
+    LAB = H / math.sin(rad(alpha))
+    V_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    V_tot = 0.5 * H * H / math.tan(rad(alpha))
+    V_soil = V_tot - V_LCC
+    return H, L2, LAB, V_LCC, V_soil
+
+# ---------- Wedge thrust (Eq. 21 mapping) ----------
+def thrust_P(W, theta, phi, c_prime, Lc, kh_val):
+    """
+    P = [ W*((sinθ - cosθ*tanφ) + kh*(cosθ + sinθ*tanφ)) - c' * Lc ] / (cosθ + sinθ*tanφ)
+    """
+    s = math.sin(rad(theta)); c = math.cos(rad(theta)); tphi = math.tan(rad(phi))
+    den = (c + s * tphi)
+    if abs(den) < 1e-12:
+        den = 1e-12
+    return (W * ((s - c * tphi) + kh_val * (c + s * tphi)) - c_prime * Lc) / den
+
+# ---------- Stage-3 (Case A) — V.03 ----------
+def evaluate_caseA_at_alpha(alpha, beta, phi, c_prime, h2):
+    """
+    Version: 2026-01-29 V.03  —  PSEUDO-STATIC CHANGES ONLY (Case A, Wedge 1)
+
+    Notes (changes vs V.02):
+      1) Added vertical centroid arm z1B_ps for Wedge 1 under ps masses only:
+         z1B_ps = [ W_LCC1*(2/3*h_BC) + Wp1*(h_BC + h3/2) ] / W1_ps
+      2) Pseudo-static branch rules for Wedge 1 moment at A:
+         - If P1E <= 0: enforce h_ps = 0 and M1_ps = 0.
+         - If P1E > 0 and P1(alpha_ps) < 0:
+             set z_p1_ps = z1B_ps;  M1_ps = P1E*(z1B_ps + h_soil).
+         - If P1E > 0 and P1(alpha_ps) >= 0:
+             compute z_p1_ps from full moment equilibrium about B including the
+             missing pseudo-static body force moment KH*W1_ps*z1B_ps:
+
+               e1B_ps = [ W_LCC1*(L1/3) + Wp1*(L1/2) ] / W1_ps
+               g1_ps  = e1B_ps / cos(beta)
+               N1_ps  = W1_ps*cos(beta) - KH*W1_ps*sin(beta) + P1E*sin(beta)
+
+               z_p1_ps = [ g1_ps*N1_ps - (W_LCC1*L1/3 + Wp1*L1/2) + KH*W1_ps*z1B_ps ] / P1E
+
+             then clamp z_p1_ps to [0, h_BC] and set:
+               M1_ps = P1E*(z_p1_ps + h_soil)
+
+      3) P_A and P_AE magnitudes are unchanged by these rules; only h_ps is affected.
+      4) Pseudo-static masses exclude surcharge (Wt), consistent with V.02.
+    """
+    g = wedge2_caseA_areas_centroids(alpha, beta, h2)
+
+    # Wedge 2 weights
+    W_soil2 = GAM_SOIL * g['V_soil2']
+    W_LCC2  = GAM_LCC  * g['V_LCC2']
+    Wp2     = GAM_PAVE * h3 * g['L2']
+    Wt2     = SURCH    * g['L2']
+    W2_body = W_soil2 + W_LCC2
+    W2_st   = W2_body + Wp2 + Wt2
+    W2_ps   = W2_body + Wp2            # surcharge excluded in ps
+
+    # Centroid arms (Wedge 2) for ps mass
+    x2_ps = (W2_body*((W_soil2*g['x_S2'] + W_LCC2*g['x_L2'])/(W2_body if W2_body else 1)) +
+             Wp2*(g['L2']/2.0)) / (W2_ps if W2_ps else 1)
+    z2_ps = (W2_body*((W_soil2*g['z_S2'] + W_LCC2*g['z_L2'])/(W2_body if W2_body else 1)) +
+             Wp2*(g['H'] + h3/2.0)) / (W2_ps if W2_ps else 1)
+
+    # Wedge 1 weights (Case A)
+    V_LCC1 = 0.5 * g['L1'] * g['h_BC']
+    W_LCC1 = GAM_LCC * V_LCC1
+    Wp1    = GAM_PAVE * h3 * g['L1']
+    Wt1    = SURCH * g['L1']
+    W1_st  = W_LCC1 + Wp1 + Wt1
+    W1_ps  = W_LCC1 + Wp1                # surcharge excluded in ps
+
+    # Thrusts (Case A) at same alpha
+    P1  = thrust_P(W1_st, beta,  phi, c_prime, g['LBO'], kh_val=0.0)   # static at alpha_ps
+    P1E = thrust_P(W1_ps, beta,  phi, c_prime, g['LBO'], kh_val=KH)    # pseudo-static
+    P2  = thrust_P(W2_st, alpha, phi, c_prime, g['LAB'], kh_val=0.0)
+    P2E = thrust_P(W2_ps, alpha, phi, c_prime, g['LAB'], kh_val=KH)
+
+    include1  = P1  > 0.0
+    include1E = P1E > 0.0
+
+    PA  = (P1  if include1  else 0.0) + P2
+    PAE = (P1E if include1E else 0.0) + P2E
+
+    # ---- Static resultant height (unchanged) ----
+    N_st = W2_st * math.cos(rad(alpha)) + P2 * math.sin(rad(alpha))
+    x2_tot = (W_soil2*g['x_S2'] + W_LCC2*g['x_L2'] + Wp2*(g['L2']/2.0) + Wt2*(g['L2']/2.0)) / (W2_st if W2_st else 1)
+    gst = x2_tot / math.cos(rad(alpha))
+    M1_st = 0.0
+    if include1 and P1 != 0.0:
+        e1B_st = (W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0) + Wt1*(g['L1']/2.0)) / (W1_st if W1_st else 1)
+        g1_st  = e1B_st / math.cos(rad(beta))
+        N1_st  = W1_st * math.cos(rad(beta)) + P1 * math.sin(rad(beta))
+        zp1_st = (g1_st * N1_st - (W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0) + Wt1*(g['L1']/2.0))) / (P1 if P1 else 1)
+        M1_st  = P1 * (zp1_st + g['h_soil'])
+    h_st = (gst * N_st - W2_st * x2_tot + M1_st) / (PA if abs(PA) > 1e-12 else float('nan'))
+
+    # ---- Pseudo-static resultant height (V.03 finalized) ----
+    # Wedge-2 normal on alpha-plane
+    N_ps = W2_ps * math.cos(rad(alpha)) - KH * W2_ps * math.sin(rad(alpha)) + P2E * math.sin(rad(alpha))
+
+    # z1B_ps vertical centroid arm above BC for Wedge 1 (ps masses)
+    z1B_ps = (W_LCC1*(g['h_BC']*2.0/3.0) + Wp1*(g['h_BC'] + h3/2.0)) / (W1_ps if W1_ps else 1)
+
+    M1_ps = 0.0
+    if not include1E:
+        # If (P1)AE <= 0: enforce h_ps = 0 and M1_ps = 0
+        h_ps = 0.0
+    else:
+        if P1 < 0.0:
+            # Use centroid-based height directly when P1 at the SAME alpha (static) is negative
+            zp1_ps = z1B_ps
+        else:
+            # Compute zp1_ps from full moment equilibrium about B (with KH*W1_ps*z1B_ps)
+            S1 = W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0)      # weights moment about B (CW)
+            e1B_ps = S1 / (W1_ps if W1_ps else 1)              # horizontal arm
+            g1_ps  = e1B_ps / math.cos(rad(beta))              # along-plane arm
+            N1_ps  = W1_ps*math.cos(rad(beta)) - KH*W1_ps*math.sin(rad(beta)) + P1E*math.sin(rad(beta))
+            zp1_ps = (g1_ps*N1_ps - S1 + KH*W1_ps*z1B_ps) / (P1E if P1E else 1)
+            # Clamp to physical band [0, h_BC]
+            if zp1_ps < 0.0:
+                zp1_ps = 0.0
+            if zp1_ps > g['h_BC']:
+                zp1_ps = g['h_BC']
+
+        # Moment from P1E at Frame A
+        M1_ps  = P1E * (zp1_ps + g['h_soil'])
+
+        # Resultant height about A
+        gps = x2_ps / math.cos(rad(alpha))
+        h_ps = (gps * N_ps - W2_ps * x2_ps + KH * W2_ps * z2_ps + M1_ps) / (PAE if abs(PAE) > 1e-12 else float('nan'))
+
+    return dict(alpha=alpha, PA=PA, PAE=PAE, h_st=h_st, h_ps=h_ps)
+
+# ---------- Stage-3 (Case B) ----------
+def evaluate_caseB_at_alpha(alpha, beta, phi, c_prime, h2):
+    H, L2, LAB, V_LCC, V_soil = caseB_geometry(alpha, beta, h2)
+    W_LCC = GAM_LCC  * V_LCC
+    W_soil= GAM_SOIL * V_soil
+    W_body= W_LCC + W_soil
+    Wp    = GAM_PAVE * h3 * L2
+    Wt    = SURCH    * L2
+    W_st  = W_body + Wp + Wt
+    W_ps  = W_body + Wp
+
+    P_st  = thrust_P(W_st, alpha, phi, c_prime, LAB, kh_val=0.0)
+    P_ps  = thrust_P(W_ps, alpha, phi, c_prime, LAB, kh_val=KH)
+
+    # Centroids (strip subtraction)
+    x_tot = H / math.tan(rad(alpha)) / 3.0; z_tot = 2 * H / 3.0
+    x_LCC = h2 / math.tan(rad(beta)) / 3.0; z_LCC = h1 + 2 * h2 / 3.0
+    A_tot = 0.5 * H * H / math.tan(rad(alpha))
+    A_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    A_soil= A_tot - A_LCC if A_tot - A_LCC != 0 else 1.0
+    x_soil= (A_tot * x_tot - A_LCC * x_LCC) / A_soil
+    z_soil= (A_tot * z_tot - A_LCC * z_LCC) / A_soil
+
+    e_tot = (W_body * ((W_soil * x_soil + W_LCC * x_LCC) / (W_body if W_body else 1))
+             + Wp * (L2/2.0) + Wt * (L2/2.0)) / (W_st if W_st else 1)
+    gst  = e_tot / math.cos(rad(alpha))
+    N_st = W_st  * math.cos(rad(alpha)) + P_st * math.sin(rad(alpha))
+    h_st = (gst * N_st - W_st * e_tot) / (P_st if abs(P_st) > 1e-12 else float('nan'))
+
+    x_body= (W_soil * x_soil + W_LCC * x_LCC) / (W_body if W_body else 1)
+    z_body= (W_soil * z_soil + W_LCC * z_LCC) / (W_body if W_body else 1)
+    x_ps  = (W_body * x_body + Wp * (L2/2.0)) / (W_ps if W_ps else 1)
+    z_ps  = (W_body * z_body + Wp * (H + h3/2.0)) / (W_ps if W_ps else 1)
+    gps   = x_ps / math.cos(rad(alpha))
+    N_ps  = W_ps * math.cos(rad(alpha)) - KH * W_ps * math.sin(rad(alpha)) + P_ps * math.sin(rad(alpha))
+    h_ps  = (gps * N_ps - W_ps * x_ps + KH * W_ps * z_ps) / (P_ps if abs(P_ps) > 1e-12 else float('nan'))
+
+    return dict(alpha=alpha, PA=P_st, PAE=P_ps, h_st=h_st, h_ps=h_ps)
+
+# ---------- Scan alpha and pick max positive thrust in each regime ----------
+def run_scan(beta, phi, c_prime, h2, amin=15.0, amax=75.0, step=0.5):
+    H = h1 + h2
+    alpha_crit = math.degrees(math.atan((H * math.tan(rad(beta))) / h2))
+    alphas = [amin + i*step for i in range(int((amax - amin)/step) + 1)]
+
+    A_list, B_list = [], []
+    for a in alphas:
+        if a > alpha_crit:
+            A_list.append(evaluate_caseA_at_alpha(a, beta, phi, c_prime, h2))
+        else:
+            B_list.append(evaluate_caseB_at_alpha(a, beta, phi, c_prime, h2))
+
+    def pick_max_pos(lst, key):
+        pos = [d for d in lst if d[key] is not None and d[key] > 0]
+        return max(pos, key=lambda d: d[key]) if pos else None
+
+    return dict(alpha_crit=alpha_crit,
+                A_st=pick_max_pos(A_list, 'PA'),
+                A_ps=pick_max_pos(A_list, 'PAE'),
+                B_st=pick_max_pos(B_list, 'PA'),
+                B_ps=pick_max_pos(B_list, 'PAE'))
+
+# ---------- 27 Cases (with beta=26.57° where updated) ----------
+CASES = [
+    (1, 25.0, 45.0,   0.0, 34.0), (2, 25.0, 33.7,   0.0, 34.0), (3, 25.0, 26.57,  0.0, 34.0),
+    (4, 25.0, 45.0, 100.0, 34.0), (5, 25.0, 45.0, 200.0, 34.0), (6, 25.0, 33.7,   0.0, 30.0),
+    (7, 25.0, 26.57,  0.0, 30.0), (8, 25.0, 33.7, 100.0, 30.0), (9, 25.0, 33.7, 200.0, 30.0),
+    (10,30.0, 45.0,   0.0, 34.0), (11,30.0, 33.7,   0.0, 34.0), (12,30.0, 26.57,  0.0, 34.0),
+    (13,30.0, 45.0, 100.0, 34.0), (14,30.0, 45.0, 200.0, 34.0), (15,30.0, 33.7,   0.0, 30.0),
+    (16,30.0, 26.57,  0.0, 30.0), (17,30.0, 33.7, 100.0, 30.0), (18,30.0, 33.7, 200.0, 30.0),
+    (19,35.0, 45.0,   0.0, 34.0), (20,35.0, 33.7,   0.0, 34.0), (21,35.0, 26.57,  0.0, 34.0),
+    (22,35.0, 45.0, 100.0, 34.0), (23,35.0, 45.0, 200.0, 34.0), (24,35.0, 33.7,   0.0, 30.0),
+    (25,35.0, 26.57,  0.0, 30.0), (26,35.0, 33.7, 100.0, 30.0), (27,35.0, 33.7, 200.0, 30.0),
+]
+
+# ---------- Main ----------
+def main():
+    rows = []
+    for cid, h2, beta, cprime, phi in CASES:
+        res = run_scan(beta, phi, cprime, h2)
+        if res['A_st']:
+            rows.append({'Case':cid,'h2(ft)':h2,'Regime':'A','beta(deg)':beta,"c'(psf)":cprime,'phi(deg)':phi,
+                         'alpha*_st':round(res['A_st']['alpha'],2),'PA (lb/ft)':round(res['A_st']['PA'],2),'h_st (ft)':round(res['A_st']['h_st'],2),
+                         'alpha*_ps':round(res['A_ps']['alpha'],2) if res['A_ps'] else float('nan'),
+                         'PAE (lb/ft)':round(res['A_ps']['PAE'],2) if res['A_ps'] else float('nan'),
+                         'h_ps (ft)':round(res['A_ps']['h_ps'],2) if res['A_ps'] else float('nan')})
+        if res['B_st']:
+            rows.append({'Case':cid,'h2(ft)':h2,'Regime':'B','beta(deg)':beta,"c'(psf)":cprime,'phi(deg)':phi,
+                         'alpha*_st':round(res['B_st']['alpha'],2),'PA (lb/ft)':round(res['B_st']['PA'],2),'h_st (ft)':round(res['B_st']['h_st'],2),
+                         'alpha*_ps':round(res['B_ps']['alpha'],2) if res['B_ps'] else float('nan'),
+                         'PAE (lb/ft)':round(res['B_ps']['PAE'],2) if res['B_ps'] else float('nan'),
+                         'h_ps (ft)':round(res['B_ps']['h_ps'],2) if res['B_ps'] else float('nan')})
+
+    out_df = pd.DataFrame(rows)
+    out_df['RegOrder'] = out_df['Regime'].map({'A':0,'B':1})
+    out_df = out_df.sort_values(['Case','RegOrder']).drop(columns=['RegOrder']).reset_index(drop=True)
+
+    # Governing rows per case
+    static_rows, ps_rows = [], []
+    for cid in sorted(out_df['Case'].unique()):
+        g = out_df[out_df['Case']==cid]
+        gpos_st = g[g['PA (lb/ft)'] > 0]
+        gpos_ps = g[g['PAE (lb/ft)'] > 0]
+        sr = gpos_st.loc[gpos_st['PA (lb/ft)'].idxmax()] if not gpos_st.empty else None
+        pr = gpos_ps.loc[gpos_ps['PAE (lb/ft)'].idxmax()] if not gpos_ps.empty else None
+        if sr is not None:
+            static_rows.append({'Case':cid,'GovReg_st':sr['Regime'],'alpha*_st':sr['alpha*_st'],
+                                'PA (lb/ft)':sr['PA (lb/ft)'],'h_st (ft)':sr['h_st (ft)']})
+        else:
+            static_rows.append({'Case':cid,'GovReg_st':'-','alpha*_st':float('nan'),
+                                'PA (lb/ft)':float('nan'),'h_st (ft)':float('nan')})
+        if pr is not None:
+            ps_rows.append({'Case':cid,'GovReg_ps':pr['Regime'],'alpha*_ps':pr['alpha*_ps'],
+                            'PAE (lb/ft)':pr['PAE (lb/ft)'],'h_ps (ft)':pr['h_ps (ft)']})
+        else:
+            ps_rows.append({'Case':cid,'GovReg_ps':'-','alpha*_ps':float('nan'),
+                            'PAE (lb/ft)':float('nan'),'h_ps (ft)':float('nan')})
+
+    static_df = pd.DataFrame(static_rows)
+    ps_df     = pd.DataFrame(ps_rows)
+
+    summary_df = (out_df[['Case','h2(ft)','Regime','beta(deg)',"c'(psf)",'phi(deg)',
+                          'alpha*_st','PA (lb/ft)','h_st (ft)','alpha*_ps','PAE (lb/ft)','h_ps (ft)']]
+                  .merge(static_df,on='Case').merge(ps_df,on='Case'))
+
+    sum_path = f'table2_27cases_summary_{VERSION}.csv'
+    summary_df.to_csv(sum_path,index=False)
+
+    gov_df = static_df.merge(ps_df,on='Case')
+    inp_df = pd.DataFrame(CASES,columns=['Case','h2(ft)','beta(deg)',"c'(psf)",'phi(deg)'])
+    gov_df = inp_df.merge(gov_df,on='Case').sort_values('Case')
+
+    gov_path = f'table2_27cases_governing_{VERSION}.csv'
+    gov_df.to_csv(gov_path,index=False)
+
+    # LaTeX governing-only table
+    lines = []
+    lines.append('% Auto-generated, ' + VERSION + ', ' + TIMESTAMP)
+    lines.append('\\begin{table*}[t]')
+    lines.append('\\centering')
+    lines.append('\\caption{Governing thrusts and resultant heights for 27 validation cases (static and pseudo-static) using V.03. Angles in degrees; thrusts in lb/ft; heights in ft.}')
+    lines.append('\\begin{tabular}{r r r r r r r r r r r}')
+    lines.append('\\toprule')
+    lines.append('Case & $h_2$ & $\\beta$ & $c\\,' + "'" + '$ & $\\varphi$ & Reg$_{st}$ & $\\alpha^*_{st}$ & $P_A$ & $h_{st}$ & Reg$_{ps}$ & $P_{AE}$ / $h_{ps}$ \\\\')
+    lines.append('\\midrule')
+    for _, r in gov_df.iterrows():
+        row = '{0:d} & {1:.0f} & {2:.2f} & {3:.0f} & {4:.0f} & {5} & {6:.2f} & {7:.2f} & {8:.2f} & {9} & {10:.2f} / {11:.2f} \\\\'.format(
+            int(r['Case']), r['h2(ft)'], r['beta(deg)'], r["c'(psf)"], r['phi(deg)'],
+            r['GovReg_st'], r['alpha*_st'], r['PA (lb/ft)'], r['h_st (ft)'],
+            r['GovReg_ps'], r['PAE (lb/ft)'], r['h_ps (ft)']
+        )
+        lines.append(row)
+    lines.append('\\bottomrule')
+    lines.append('\\end{tabular}')
+    lines.append('\\end{table*}')
+
+    tex_path = f'table2_27cases_governing_{VERSION}.tex'
+    with open(tex_path,'w') as f:
+        f.write('\n'.join(lines))
+
+    return sum_path, gov_path, tex_path
+
+if __name__ == "__main__":
+    files = main()
+    print({"version": VERSION, "timestamp": TIMESTAMP, "files": files})
