@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+# =============================================================================
+# wedge_single_V07.py  (User-input only; unit-agnostic math; Regime A/B)
+# Version: 2026-02-09 V.07
+#
+# What this does
+#   • Preserves the V.06 alpha-scan solver (static & pseudo-static) for Regime B (single wedge)
+#     and Regime A (two wedges).
+#   • Adds a Regime A subroutine that scans by h_soil (soil height at heel) and back-calculates α
+#     to stabilize results when |α_crit − β| is small and c' > 0, or when h1 = 0.
+#   • Math is unit-agnostic: use consistent units throughout (SI or US). The --units flag only
+#     affects PRINTED LABELS (console/JSON), not the math.
+#
+# Auto-trigger (applied in V.07 main)
+#   Use Regime A h_soil-scan (in addition to the standard evaluation of Regime B) if EITHER:
+#     (T1) h1 == 0, OR
+#     (T2) (α_crit − β) < 2 degrees AND c' > 0.
+#   Otherwise, use the V.06 alpha-scan for both Regimes.
+#
+# Pseudo-static vertical centroid rules (Regime nomenclature):
+#   • Regime A, Wedge 2: pavement vertical arm at H/2 (dead weight).
+#   • Regime A, Wedge 1: pavement vertical arm at h_BC/2 (dead weight on BC face).
+#   • Regime B: pavement vertical arm at H/2 (dead weight).
+# Rule-2: If P1E <= 0, exclude M1_ps ONLY (do not force h_ps = 0).
+# Surcharge is excluded from pseudo-static weights (as in V.06).
+#
+# CLI (non-interactive recommended):
+#   python wedge_single_V07.py --no-prompt --units si \
+#     --h1 <len> --h2 <len> --h3 <len> \
+#     --gam-soil <UW> --gam-lcc <UW> --gam-pave <UW> --surch <stress> \
+#     --KH <-> --beta <deg> --phi <deg> --cprime <stress> \
+#     --amin <deg> --amax <deg> --dalpha <deg> --refine-band <deg> --refine-step <deg> \
+#     [--hmin <len> --hmax <len> --hstep <len|'auto'>] [--json out.json]
+#
+# Inputs to keep consistent:
+#   SI  : length [m], unit weights [kN/m^3], stresses [kPa]; outputs -> [kN/m].
+#   US  : length [ft], unit weights [pcf],   stresses [psf]; outputs -> [lb/ft].
+# =============================================================================
+
+import math, argparse, json, sys
+from datetime import datetime
+from typing import Optional
+rad = math.radians
+
+# ---------- Utilities ----------
+def _ensure_value(name: str, value: Optional[float]) -> float:
+    if value is None:
+        raise ValueError(f"Missing required input: {name}")
+    try:
+        return float(value)
+    except Exception:
+        raise ValueError(f"Invalid numeric value for {name}: {value}")
+
+# ---------- Thrust mapping ----------
+def thrust_P(W: float, theta_deg: float, phi_deg: float, c_prime: float, Lc: float, kh_val: float) -> float:
+    s = math.sin(rad(theta_deg)); c = math.cos(rad(theta_deg)); tphi = math.tan(rad(phi_deg))
+    den = (c + s * tphi)
+    if abs(den) < 1e-12: den = 1e-12
+    return (W * ((s - c * tphi) + kh_val * (c + s * tphi)) - c_prime * Lc) / den
+
+# ---------- Geometry ----------
+def regimeA_geometry(alpha: float, beta: float, h1: float, h2: float):
+    ta = math.tan(rad(alpha)); tb = math.tan(rad(beta)); H = h1 + h2
+    if abs(ta - tb) < 1e-12: ta += 1e-12
+    h_soil = h1 * ta / (ta - tb)
+    h_BC   = H - h_soil
+    L1     = h_BC / math.tan(rad(beta))
+    LBO    = L1 / math.cos(rad(beta))
+    L2     = h2 / math.tan(rad(beta)) - L1
+    LAB    = h_soil / math.sin(rad(alpha))
+    return H, h_soil, h_BC, L1, LBO, L2, LAB
+
+def wedge2_regimeA_areas_centroids(alpha: float, beta: float, h1: float, h2: float):
+    H, h_soil, h_BC, L1, LBO, L2, LAB = regimeA_geometry(alpha, beta, h1, h2)
+    V_soil2 = 0.5 * h1 * L2
+    x_S2 = L2 / 3.0
+    z_S2 = (h1 + h_soil) / 3.0
+    V_LCC2 = L2 * (H - 0.5 * (h1 + h_soil))
+    denom = (2*H - h1 - h_soil)
+    if abs(denom) < 1e-12:
+        x_L2 = L2 / 2.0; z_L2 = (H + h1) / 2.0
+    else:
+        x_L2 = L2 * (3*H - h1 - 2*h_soil) / (3 * denom)
+        z_L2 = (H*H - (h_soil*h_soil + h1*h1 + h1*h_soil)/3.0) / denom
+    return dict(H=H, h_soil=h_soil, h_BC=h_BC, L1=L1, LBO=LBO, L2=L2, LAB=LAB,
+                V_soil2=V_soil2, x_S2=x_S2, z_S2=z_S2, V_LCC2=V_LCC2, x_L2=x_L2, z_L2=z_L2)
+
+def regimeB_geometry(alpha: float, beta: float, h1: float, h2: float):
+    H = h1 + h2
+    L2 = H / math.tan(rad(alpha))
+    LAB = H / math.sin(rad(alpha))
+    V_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    V_tot = 0.5 * H * H / math.tan(rad(alpha))
+    V_soil = V_tot - V_LCC
+    return H, L2, LAB, V_LCC, V_soil
+
+# ---------- Regime A & B evaluators (V.06) ----------
+def evaluate_regimeA_at_alpha(alpha: float, beta: float, phi: float, c_prime: float,
+                              h1: float, h2: float, h3: float,
+                              gam_soil: float, gam_lcc: float, gam_pave: float, surch: float,
+                              KH: float):
+    g = wedge2_regimeA_areas_centroids(alpha, beta, h1, h2)
+    W_soil2 = gam_soil * g['V_soil2']; W_LCC2 = gam_lcc * g['V_LCC2']
+    Wp2 = gam_pave * h3 * g['L2'];    Wt2 = surch * g['L2']
+    W2_body = W_soil2 + W_LCC2
+    W2_st   = W2_body + Wp2 + Wt2
+    W2_ps   = W2_body + Wp2  # surcharge excluded in pseudo-static
+    x2_ps = (W2_body*((W_soil2*g['x_S2'] + W_LCC2*g['x_L2'])/(W2_body if W2_body else 1)) + Wp2*(g['L2']/2.0))/(W2_ps if W2_ps else 1)
+    z2_ps = (W2_body*((W_soil2*g['z_S2'] + W_LCC2*g['z_L2'])/(W2_body if W2_body else 1)) + Wp2*(g['H']/2.0))/(W2_ps if W2_ps else 1)
+    V_LCC1 = 0.5 * g['L1'] * g['h_BC']; W_LCC1 = gam_lcc * V_LCC1
+    Wp1 = gam_pave * h3 * g['L1'];     Wt1 = surch * g['L1']
+    W1_st = W_LCC1 + Wp1 + Wt1;        W1_ps = W_LCC1 + Wp1
+    P1  = thrust_P(W1_st, beta,  phi, c_prime, g['LBO'], 0.0)
+    P1E = thrust_P(W1_ps, beta,  phi, c_prime, g['LBO'], KH)
+    P2  = thrust_P(W2_st, alpha, phi, c_prime, g['LAB'], 0.0)
+    P2E = thrust_P(W2_ps, alpha, phi, c_prime, g['LAB'], KH)
+    include1E = P1E > 0.0
+    PAE = (P1E if include1E else 0.0) + P2E
+    # pseudo height
+    N_ps = W2_ps * math.cos(rad(alpha)) - KH * W2_ps * math.sin(rad(alpha)) + P2E * math.sin(rad(alpha))
+    z1B_ps = (W_LCC1*(g['h_BC']*2.0/3.0) + Wp1*(g['h_BC']/2.0)) / (W1_ps if W1_ps else 1)
+    if not include1E:
+        M1_ps = 0.0
+    else:
+        if P1 < 0.0:
+            zp1_ps = z1B_ps
+        else:
+            S1     = W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0)
+            e1B_ps = S1 / (W1_ps if W1_ps else 1)
+            g1_ps  = e1B_ps / math.cos(rad(beta))
+            N1_ps  = W1_ps * math.cos(rad(beta)) - KH * W1_ps * math.sin(rad(beta)) + P1E * math.sin(rad(beta))
+            zp1_ps = (g1_ps * N1_ps - S1 + KH * W1_ps * z1B_ps) / (P1E if P1E else 1)
+            if   zp1_ps < 0.0:       zp1_ps = 0.0
+            elif zp1_ps > g['h_BC']: zp1_ps = g['h_BC']
+        M1_ps = P1E * (zp1_ps + g['h_soil'])
+    gps = x2_ps / math.cos(rad(alpha))
+    h_ps = (gps * N_ps - W2_ps * x2_ps + KH * W2_ps * z2_ps + M1_ps) / (PAE if abs(PAE) > 1e-12 else float('nan'))
+    # static height
+    include1 = P1 > 0.0
+    PA = (P1 if include1 else 0.0) + P2
+    x2_tot = (W_soil2*g['x_S2'] + W_LCC2*g['x_L2'] + Wp2*(g['L2']/2.0) + Wt2*(g['L2']/2.0)) / (W2_st if W2_st else 1)
+    gst    = x2_tot / math.cos(rad(alpha))
+    N_st   = W2_st * math.cos(rad(alpha)) + P2 * math.sin(rad(alpha))
+    M1_st  = 0.0
+    if include1 and P1 != 0.0:
+        S1     = W_LCC1*(g['L1']/3.0) + Wp1*(g['L1']/2.0) + Wt1*(g['L1']/2.0)
+        e1B_st = S1 / (W1_st if W1_st else 1)
+        g1_st  = e1B_st / math.cos(rad(beta))
+        N1_st  = W1_st * math.cos(rad(beta)) + P1 * math.sin(rad(beta))
+        zp1_st = (g1_st * N1_st - S1) / (P1 if P1 else 1)
+        M1_st  = P1 * (zp1_st + g['h_soil'])
+    h_st = (gst * N_st - W2_st * x2_tot + M1_st) / (PA if abs(PA) > 1e-12 else float('nan'))
+    return dict(alpha=alpha, PA=PA, h_st=h_st, PAE=PAE, h_ps=h_ps)
+
+def evaluate_regimeB_at_alpha(alpha: float, beta: float, phi: float, c_prime: float,
+                              h1: float, h2: float, h3: float,
+                              gam_soil: float, gam_lcc: float, gam_pave: float, surch: float,
+                              KH: float):
+    H, L2, LAB, V_LCC, V_soil = regimeB_geometry(alpha, beta, h1, h2)
+    W_LCC = gam_lcc * V_LCC; W_soil = gam_soil * V_soil
+    W_body= W_LCC + W_soil
+    Wp    = gam_pave * h3 * L2; Wt = surch * L2
+    W_st  = W_body + Wp + Wt;   W_ps = W_body + Wp
+    P_st  = thrust_P(W_st, alpha, phi, c_prime, LAB, 0.0)
+    P_ps  = thrust_P(W_ps, alpha, phi, c_prime, LAB, KH)
+    # static height (info)
+    x_tot = H / math.tan(rad(alpha)) / 3.0; z_tot = 2 * H / 3.0
+    x_LCC = h2 / math.tan(rad(beta)) / 3.0; z_LCC = h1 + 2 * h2 / 3.0
+    A_tot = 0.5 * H * H / math.tan(rad(alpha)); A_LCC = 0.5 * h2 * h2 / math.tan(rad(beta))
+    A_soil= A_tot - A_LCC if A_tot - A_LCC != 0 else 1.0
+    x_soil= (A_tot * x_tot - A_LCC * x_LCC) / A_soil; z_soil= (A_tot * z_tot - A_LCC * z_LCC) / A_soil
+    x_body= (W_soil * x_soil + W_LCC * x_LCC) / (W_body if W_body else 1)
+    e_tot = (W_body * x_body + Wp * (L2/2.0) + Wt * (L2/2.0)) / (W_st if W_st else 1)
+    gst   = e_tot / math.cos(rad(alpha)); N_st  = W_st * math.cos(rad(alpha)) + P_st * math.sin(rad(alpha))
+    h_st  = (gst * N_st - W_st * e_tot) / (P_st if abs(P_st) > 1e-12 else float('nan'))
+    # pseudo height (info)
+    x_ps  = (W_body * x_body + Wp * (L2/2.0)) / (W_ps if W_ps else 1)
+    gps   = x_ps / math.cos(rad(alpha)); N_ps  = W_ps * math.cos(rad(alpha)) - KH * W_ps * math.sin(rad(alpha)) + P_ps * math.sin(rad(alpha))
+    h_ps  = (gps * N_ps - W_ps * x_ps) / (P_ps if abs(P_ps) > 1e-12 else float('nan'))
+    return dict(alpha=alpha, PA=P_st, h_st=h_st, PAE=P_ps, h_ps=h_ps)
+
+# ---------- V.06 alpha-scan ----------
+def run_scan_single_V06(h1,h2,h3,gs,glcc,gp,q,KH,beta,phi,cprime, amin,amax,dalpha,ref_band,ref_step):
+    H = h1 + h2
+    alpha_crit = math.degrees(math.atan((H * math.tan(rad(beta))) / h2))
+    alphas = [amin + i*dalpha for i in range(int((amax-amin)/dalpha)+1)]
+    a_lo = max(amin, alpha_crit - ref_band); a_hi = min(amax, alpha_crit + ref_band)
+    fine = [a_lo + i*ref_step for i in range(int(round((a_hi-a_lo)/ref_step))+1)] + [alpha_crit]
+    all_alphas = sorted(set([round(a,6) for a in (alphas + fine)]))
+    A_list=[]; B_list=[]
+    for a in all_alphas:
+        if a > alpha_crit:
+            A_list.append(evaluate_regimeA_at_alpha(a,beta,phi,cprime,h1,h2,h3,gs,glcc,gp,q,KH))
+        else:
+            B_list.append(evaluate_regimeB_at_alpha(a,beta,phi,cprime,h1,h2,h3,gs,glcc,gp,q,KH))
+    def pick(lst,key):
+        pos = [d for d in lst if d[key] is not None and d[key] > 0]
+        return max(pos, key=lambda d: d[key]) if pos else None
+    return dict(alpha_crit=alpha_crit, A_st=pick(A_list,'PA'), A_ps=pick(A_list,'PAE'), B_st=pick(B_list,'PA'), B_ps=pick(B_list,'PAE'))
+
+# ---------- Regime A: α from h_soil ----------
+def alpha_from_hsoil(h_soil: float, beta: float, h1: float) -> float:
+    tb = math.tan(rad(beta)); denom = (h_soil - h1)
+    if abs(denom) < 1e-12: denom = 1e-12 if denom >= 0 else -1e-12
+    t = tb * (h_soil / denom)
+    a = math.degrees(math.atan(t))
+    if a < 1e-9: a = 1e-9
+    if a > 89.9999: a = 89.9999
+    return a
+
+def evaluate_regimeA_at_alpha_from_hsoil(h_soil,beta,phi,cprime,h1,h2,h3,gs,glcc,gp,q,KH):
+    a = alpha_from_hsoil(h_soil,beta,h1)
+    out = evaluate_regimeA_at_alpha(a,beta,phi,cprime,h1,h2,h3,gs,glcc,gp,q,KH)
+    out2 = out.copy(); out2['alpha']=a; out2['h_soil']=h_soil
+    return out2
+
+def run_hsoil_scan(h1,h2,h3,gs,glcc,gp,q,KH,beta,phi,cprime,hmin,hmax,hstep):
+    H = h1 + h2
+    alpha_crit = math.degrees(math.atan((H * math.tan(rad(beta))) / h2))
+    if hstep <= 0: raise ValueError('hstep must be > 0')
+    hs = [hmin + i*hstep for i in range(int(math.floor((hmax-hmin)/hstep))+1)]
+    if abs(hs[-1]-hmax) > 1e-9: hs.append(hmax)
+    rows = []
+    for h in hs:
+        try:
+            rows.append(evaluate_regimeA_at_alpha_from_hsoil(h,beta,phi,cprime,h1,h2,h3,gs,glcc,gp,q,KH))
+        except Exception as e:
+            rows.append(dict(alpha=float('nan'),PA=float('nan'),h_st=float('nan'),PAE=float('nan'),h_ps=float('nan'),h_soil=h,error=str(e)))
+    def pick(lst,key):
+        pos = [d for d in lst if d.get(key) is not None and isinstance(d.get(key),(int,float)) and d.get(key)>0]
+        return max(pos, key=lambda d: d[key]) if pos else None
+    return dict(alpha_crit=alpha_crit, rows=rows, A_st=pick(rows,'PA'), A_ps=pick(rows,'PAE'))
+
+# ---------- CLI ----------
+def build_parser():
+    p = argparse.ArgumentParser(description='V.07 wedge solver (user-input only) with h_soil-scan auto-trigger (Regime A).')
+    p.add_argument('--no-prompt', action='store_true')
+    # Required inputs
+    p.add_argument('--h1', type=float); p.add_argument('--h2', type=float); p.add_argument('--h3', type=float)
+    p.add_argument('--gam-soil', type=float); p.add_argument('--gam-lcc', type=float); p.add_argument('--gam-pave', type=float); p.add_argument('--surch', type=float)
+    p.add_argument('--KH', type=float); p.add_argument('--beta', type=float); p.add_argument('--phi', type=float); p.add_argument('--cprime', type=float)
+    # Alpha-scan controls
+    p.add_argument('--amin', type=float); p.add_argument('--amax', type=float); p.add_argument('--dalpha', type=float); p.add_argument('--refine-band', type=float); p.add_argument('--refine-step', type=float)
+    # h_soil controls
+    p.add_argument('--hmin', type=float); p.add_argument('--hmax', type=float); p.add_argument('--hstep', type=str)
+    # Units labeling (labels only)
+    p.add_argument('--units', type=str, choices=['US','SI','us','si'], default='US', help='Labels only (math unchanged)')
+    # JSON
+    p.add_argument('--json', type=str)
+    return p
+
+def main():
+    args = build_parser().parse_args()
+    units_raw = (args.units or 'US').upper()
+    if units_raw == 'SI': LBL_L='[m]'; LBL_GS='[kN/m³]'; LBL_Q='[kPa]'; LBL_OUT='[kN/m]'
+    else: LBL_L='[ft]'; LBL_GS='[pcf]'; LBL_Q='[psf]'; LBL_OUT='[lb/ft]'
+
+    if args.no_prompt:
+        h1=_ensure_value('h1',args.h1); h2=_ensure_value('h2',args.h2); h3=_ensure_value('h3',args.h3)
+        gs=_ensure_value('gam-soil',args.gam_soil); glcc=_ensure_value('gam-lcc',args.gam_lcc); gp=_ensure_value('gam-pave',args.gam_pave); q=_ensure_value('surch',args.surch)
+        KH=_ensure_value('KH',args.KH); beta=_ensure_value('beta',args.beta); phi=_ensure_value('phi',args.phi); cp=_ensure_value('cprime',args.cprime)
+        amin=_ensure_value('amin',args.amin); amax=_ensure_value('amax',args.amax); da=_ensure_value('dalpha',args.dalpha); rbd=_ensure_value('refine-band',args.refine_band); rst=_ensure_value('refine-step',args.refine_step)
+        H=h1+h2; hmin=0.0 if args.hmin is None else float(args.hmin); hmax=H if args.hmax is None else float(args.hmax)
+        hstep = (H/100.0) if (args.hstep is None or str(args.hstep).lower()=='auto') else float(args.hstep)
+    else:
+        print('Please use --no-prompt with explicit flags.'); sys.exit(2)
+
+    alpha_crit = math.degrees(math.atan(((h1+h2)*math.tan(rad(beta)))/h2))
+    use_hsoil_A = (h1==0.0) or ((alpha_crit - beta) < 2.0 and cp>0.0)
+
+    res_v06 = run_scan_single_V06(h1,h2,h3,gs,glcc,gp,q,KH,beta,phi,cp, amin,amax,da,rbd,rst)
+
+    if use_hsoil_A:
+        res_hA = run_hsoil_scan(h1,h2,h3,gs,glcc,gp,q,KH,beta,phi,cp, hmin,hmax,hstep)
+        A_st=res_hA['A_st']; A_ps=res_hA['A_ps']; B_st=res_v06['B_st']; B_ps=res_v06['B_ps']
+        method = 'V07: Regime A from h_soil-scan; Regime B from V.06 alpha-scan'
+    else:
+        A_st=res_v06['A_st']; A_ps=res_v06['A_ps']; B_st=res_v06['B_st']; B_ps=res_v06['B_ps']
+        method = 'V.06 alpha-scan for both Regimes'
+
+    def gov(A,B,key):
+        if A and (not B or A[key]>=B[key]): return 'A',A
+        else: return 'B',B
+    gov_st_regime,gov_st = gov(A_st,B_st,'PA'); gov_ps_regime,gov_ps = gov(A_ps,B_ps,'PAE')
+
+    now_utc = datetime.utcnow().isoformat()+'Z'
+    print("\n=== V.07 Results ==="); print(f"UTC: {now_utc}")
+    print(f"  Geometry: h1={h1} {LBL_L}, h2={h2} {LBL_L}, h3={h3} {LBL_L}")
+    print(f"  Materials: γ_s={gs} {LBL_GS}, γ_LCC={glcc} {LBL_GS}, γ_p={gp} {LBL_GS},  q={q} {LBL_Q}")
+    print(f"  Strength:  c'={cp} {LBL_Q}, φ={phi} [deg], β={beta} [deg], K_H={KH}")
+    print(f"  α-scan: α∈[{amin},{amax}] [deg], Δα={da} [deg]; refine ±{rbd} [deg] @ {rst} [deg]")
+    print(f"  α_crit = {alpha_crit:.6f} [deg];  Auto-trigger: {'ON' if use_hsoil_A else 'OFF'}  ->  {method}")
+
+    def show(tag,d,reg,is_ps=False):
+        if not d: print(f"{tag}: (none > 0)"); return
+        if is_ps: print(f"{tag}: Regime={reg} ; α*={d['alpha']:.6f} [deg] ; P_AE={d['PAE']:.3f} {LBL_OUT} ; h_ps={d['h_ps']:.3f} {LBL_L}")
+        else:     print(f"{tag}: Regime={reg} ; α*={d['alpha']:.6f} [deg] ; P_A={d['PA']:.3f} {LBL_OUT} ; h_st={d['h_st']:.3f} {LBL_L}")
+
+    print("\n-- Governing --")
+    show('Static',gov_st,gov_st_regime); show('Pseudo-static',gov_ps,gov_ps_regime,is_ps=True)
+
+    if args.json:
+        out = dict(meta=dict(version='2026-02-09 V.07', timestamp=now_utc),
+                   inputs=dict(h1=h1,h2=h2,h3=h3,gam_soil=gs,gam_lcc=glcc,gam_pave=gp,surch=q,KH=KH,beta=beta,phi=phi,cprime=cp,
+                               amin=amin,amax=amax,dalpha=da,refine_band=rbd,refine_step=rst,
+                               hmin=hmin,hmax=hmax,hstep=hstep, units=dict(length=LBL_L,unit_weight=LBL_GS,stress=LBL_Q,output=LBL_OUT)),
+                   alpha_crit=alpha_crit, auto_trigger=use_hsoil_A,
+                   picks=dict(gov_static=dict(regime=gov_st_regime,**(gov_st or {})), gov_ps=dict(regime=gov_ps_regime,**(gov_ps or {}))),
+                   v06=res_v06 )
+        if use_hsoil_A: out['hsoil_scan'] = res_hA
+        with open(args.json,'w') as f: json.dump(out,f,indent=2)
+        print(f"\nWrote JSON log: {args.json}")
+
+if __name__=='__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(1)
