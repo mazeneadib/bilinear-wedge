@@ -1,0 +1,177 @@
+"""
+SUPSERSEDED ARCHIVAL SCRIPT
+Regime B – FS fixed at unity; λ solved from end-force closure; base reaction evaluated.
+
+IMPORTANT NOTE (Transparency for record):
+
+This script is NOT a full Morgenstern–Price (MP/GLE) factor-of-safety solver.
+
+What it DOES:
+- Assumes FS = 1.0 (fixed, not solved).
+- Solves only for λ such that end force closure En = 0.
+- Computes slice base normal forces N_i under that assumption.
+- Post-processes N_i to obtain resultant location (s_N) and implied wall
+  line-of-action height h_Pa from moment balance.
+
+What it does NOT do:
+- It does not solve for FS by enforcing both force and moment equilibrium.
+- It does not perform the coupled (FS, λ) solution that defines full MP/GLE.
+
+This file is retained strictly for documentation and historical reference.
+"""
+
+import numpy as np
+
+
+# -----------------------------
+# Geometry + slicing
+# -----------------------------
+def build_slices_composite(
+    num_slices=200,
+    H=38.0,
+    W_total_x=59.14,
+    alpha_deg=32.72,
+    theta_lcc_deg=33.67,
+    y0_lcc=3.0,
+    gamma_soil=120.0,
+    gamma_lcc=40.0
+):
+
+    alpha = np.deg2rad(alpha_deg)
+    theta = np.deg2rad(theta_lcc_deg)
+
+    dx = W_total_x / num_slices
+    L_i = dx / np.cos(alpha)
+
+    slices = []
+    for i in range(num_slices):
+        x_mid = (i + 0.5) * dx
+
+        y_bot = x_mid * np.tan(alpha)
+        y_int = min(y0_lcc + x_mid * np.tan(theta), H)
+        y_top = H
+
+        h_soil = max(0.0, y_int - y_bot)
+        h_lcc  = max(0.0, y_top - y_int)
+
+        W_soil = h_soil * gamma_soil * dx
+        W_lcc  = h_lcc  * gamma_lcc  * dx
+        W_i = W_soil + W_lcc
+
+        y_soil_mid = y_bot + 0.5*h_soil if h_soil > 0 else 0.0
+        y_lcc_mid  = y_int + 0.5*h_lcc if h_lcc > 0 else 0.0
+
+        y_c = (W_soil*y_soil_mid + W_lcc*y_lcc_mid)/W_i if W_i > 0 else 0.0
+        x_c = x_mid
+        s_c = x_mid / np.cos(alpha)
+
+        slices.append({
+            "W": W_i,
+            "x": x_c,
+            "y": y_c,
+            "L": L_i,
+            "s": s_c
+        })
+
+    return slices
+
+
+# -----------------------------
+# GLE at FS = 1 (Half-sine MP function)
+# -----------------------------
+def gle_fs1_half_sine(
+    slices,
+    Pa,
+    alpha_deg=32.72,
+    phi_base_deg=30.0,
+    c_base=0.0,
+    kh=0.16,
+    tol_E=1e-8,
+    max_iter=80
+):
+
+    alpha = np.deg2rad(alpha_deg)
+    phi = np.deg2rad(phi_base_deg)
+    n = len(slices)
+
+    idx = np.arange(n+1)
+    f = np.sin(np.pi * idx / n)
+
+    cos_a = np.cos(alpha)
+    sin_a = np.sin(alpha)
+    tan_phi = np.tan(phi)
+
+    def march_for_lambda(lam):
+        E = np.zeros(n+1)
+        N = np.zeros(n)
+        E[0] = Pa
+
+        for i in range(n):
+            Wi = slices[i]["W"]
+            Li = slices[i]["L"]
+
+            Fx_inertia = -kh * Wi
+
+            EiL = E[i]
+            XiL = lam * f[i] * EiL
+            fR = f[i+1]
+
+            A = (tan_phi*cos_a - sin_a)
+            B = (tan_phi*sin_a + cos_a)
+
+            rhs_const = (XiL - Wi + c_base*Li*sin_a)
+            lhs_const = lam * fR * (EiL + Fx_inertia + c_base*Li*cos_a)
+
+            denom = (lam * fR * A - B)
+            if abs(denom) < 1e-14:
+                return 1e9, None, None
+
+            Ni = (rhs_const - lhs_const) / denom
+            N[i] = Ni
+
+            EiR = EiL + Fx_inertia + c_base*Li*cos_a + Ni*A
+            E[i+1] = EiR
+
+        return E[-1], N, E
+
+    lam_a, lam_b = -2.0, 2.0
+    Ea, _, _ = march_for_lambda(lam_a)
+    Eb, _, _ = march_for_lambda(lam_b)
+
+    while Ea*Eb > 0:
+        lam_a *= 2.0
+        lam_b *= 2.0
+        Ea, _, _ = march_for_lambda(lam_a)
+        Eb, _, _ = march_for_lambda(lam_b)
+
+    for _ in range(max_iter):
+        lam_new = lam_b - Eb*(lam_b-lam_a)/(Eb-Ea)
+        En, N, E = march_for_lambda(lam_new)
+        if abs(En) < tol_E:
+            lam = lam_new
+            break
+        if Ea*En < 0:
+            lam_b, Eb = lam_new, En
+        else:
+            lam_a, Ea = lam_new, En
+        lam = lam_new
+
+    sumN = np.sum(N)
+    sumNs = 0.0
+    sumWx = 0.0
+    sumWy = 0.0
+
+    for i, si in enumerate(slices):
+        sumNs += N[i] * si["s"]
+        sumWx += si["W"] * si["x"]
+        sumWy += si["W"] * si["y"]
+
+    s_N = sumNs / sumN
+    h_Pa = (sumNs + kh*sumWy - sumWx) / Pa
+
+    return {
+        "lambda": lam,
+        "s_N": s_N,
+        "h_Pa": h_Pa,
+        "sumN": sumN
+    }
