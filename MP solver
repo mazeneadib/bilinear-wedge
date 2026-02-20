@@ -1,0 +1,843 @@
+"""
+Morgenstern–Price (MP) solver for BOTH Regime A (bilinear base) and Regime B (single-plane base)
+
+Key conventions (angles from horizontal, toe at (0,0), wall at x=0):
+- Regime A base: yb(x) = min( x*tan(alpha), h1 + x*tan(beta) )
+  x_end_theory = (H - h1)/tan(beta)  (beta-line reaches crest)
+  End-point backoff: last slice width = 0.9999 * nominal dx
+- Regime B base: yb(x) = x*tan(alpha)
+  x_end = H/tan(alpha)
+
+Material split:
+- Interface line: y_int(x) = h1 + x*tan(beta)  (same beta as LCC/soil interface)
+- Soil thickness above base: max(0, min(H, y_int) - yb)
+- LCC thickness above base: max(0, H - max(y_int, yb))
+
+MP loading:
+- Wall is a boundary resultant: E0 = Pa applied in +x at height hps above toe
+- Global moment includes wall moment once: M += -Pa*hps
+- Inertia: Fx_in = -kh * W  applied at slice centroid (x_c, y_c)
+- Weight: Fy = -W applied at (x_c, y_c)
+- Base reactions applied at slip-segment midpoint (x_base, yb_base)
+
+Strength:
+- Shear along base: S = (c_base*L + N*tan(phi)) / FS
+  where c_base is psf, L is base length of slice (ft), so c*L is lb/ft.
+
+Solve:
+- Inner: for each FS, solve lambda such that En(FS,lambda)=0
+  (robust: scan lambda range to bracket a root, then bisection)
+- Outer: solve FS such that M(FS, lambda(FS)) = 0 (bisection in FS with expansion)
+
+This file also provides a regime switch:
+- alpha_crit = atan( ((h1+h2)*tan(beta))/h2 ), with H=h1+h2
+- Regime A if alpha > alpha_crit, else Regime B
+"""
+
+import math
+import numpy as np
+
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def half_sine_f(n: int) -> np.ndarray:
+    idx = np.arange(n + 1, dtype=float)
+    return np.sin(np.pi * idx / n)  # f[0]=f[n]=0
+
+
+# -------------------------
+# Regime switch
+# -------------------------
+
+def alpha_critical_deg(h1: float, h2: float, beta_deg: float) -> float:
+    if h2 <= 0:
+        raise ValueError("h2 must be > 0")
+    beta = math.radians(beta_deg)
+    val = ((h1 + h2) * math.tan(beta)) / h2
+    return math.degrees(math.atan(val))
+
+def choose_regime(alpha_deg: float, h1: float, h2: float, beta_deg: float) -> str:
+    # Per user: Regime A when alpha > alpha_crit, Regime B otherwise
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    return "A" if alpha_deg > acrit else "B"
+
+
+# -------------------------
+# Geometry primitives
+# -------------------------
+
+def y_int(x: float, h1: float, beta_rad: float) -> float:
+    return h1 + x * math.tan(beta_rad)
+
+def y_base_regimeB(x: float, alpha_rad: float) -> float:
+    return x * math.tan(alpha_rad)
+
+def y_base_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    return min(x * math.tan(alpha_rad), h1 + x * math.tan(beta_rad))
+
+def base_angle_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    ya = x * math.tan(alpha_rad)
+    yb = h1 + x * math.tan(beta_rad)
+    return alpha_rad if ya <= yb else beta_rad
+
+
+def x_end_backoff_last_slice(x_end_theory: float, n: int, last_scale: float = 0.9999) -> float:
+    """
+    Back off x_end so last slice is last_scale * dx_nom where dx_nom = x_end_theory/n.
+    """
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not (0.0 < last_scale < 1.0):
+        raise ValueError("last_scale must be in (0,1)")
+    dx = x_end_theory / n
+    return x_end_theory - (1.0 - last_scale) * dx
+
+
+# -------------------------
+# Slice builders (exact-ish integration in x)
+# -------------------------
+
+def build_slices_regimeB_singleplane_exact(
+    n: int,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float,
+    gamma_lcc: float,
+    x_samples_per_slice: int = 120,
+):
+    """
+    Regime B: base yb(x) = x*tan(alpha), x_end = H/tan(alpha).
+    Interface is always y_int(x)=h1 + x*tan(beta).
+    """
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    ta = math.tan(alpha)
+
+    if abs(ta) < 1e-12:
+        raise ValueError("alpha too small")
+
+    x_end = H / ta
+    dx = x_end / n
+
+    cos_a = math.cos(alpha)
+    if abs(cos_a) < 1e-12:
+        raise ValueError("cos(alpha) too small")
+    L_nom = dx / cos_a  # constant base length because base angle constant
+
+    slices = []
+
+    for i in range(n):
+        x0 = i * dx
+        x1 = (i + 1) * dx
+        x_mid = 0.5 * (x0 + x1)
+
+        def yb(x):   return y_base_regimeB(x, alpha)
+        def yi(x):   return y_int(x, h1, beta)
+
+        # slip midpoint for base moment arm
+        x_base = x_mid
+        yb_base = yb(x_base)
+        if yb_base >= H:
+            continue
+
+        xs = np.linspace(x0, x1, x_samples_per_slice)
+
+        A_soil = A_lcc = 0.0
+        Mx_soil = My_soil = 0.0
+        Mx_lcc  = My_lcc  = 0.0
+
+        for j in range(len(xs) - 1):
+            xa = float(xs[j]); xb = float(xs[j+1])
+            xm = 0.5*(xa+xb)
+            dxx = xb - xa
+
+            yb_a, yb_b, yb_m = yb(xa), yb(xb), yb(xm)
+            yi_a, yi_b, yi_m = yi(xa), yi(xb), yi(xm)
+
+            def t_soil(yb_, yi_):
+                return max(0.0, min(H, yi_) - yb_)
+
+            def t_lcc(yb_, yi_):
+                return max(0.0, H - max(yi_, yb_))
+
+            ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+            tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+            As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+            Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+            # strip x moments
+            Mx_soil += xm * As
+            Mx_lcc  += xm * Al
+
+            # strip y centroids (mid)
+            ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+            yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+            My_soil += ys * As
+            My_lcc  += yl * Al
+
+            A_soil += As
+            A_lcc  += Al
+
+        A_tot = A_soil + A_lcc
+        if A_tot <= 0.0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0.0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append({
+            "dx": float(dx),
+            "L": float(L_nom),
+            "a": float(alpha),
+            "W": float(W),
+            "x": float(x_c),
+            "y": float(y_c),
+            "x_base": float(x_base),
+            "yb_base": float(yb_base),
+        })
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime B). Check inputs.")
+    return slices, x_end
+
+
+def build_slices_regimeA_bilinear_exact(
+    n: int,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float,
+    gamma_lcc: float,
+    x_samples_per_slice: int = 120,
+    last_slice_scale: float = 0.9999,
+):
+    """
+    Regime A: bilinear base yb(x)=min(x*tan(alpha), h1 + x*tan(beta)).
+    Theory x_end is where beta-line reaches crest: x_end=(H-h1)/tan(beta).
+    Back off endpoint so last slice is slightly short (per user rule).
+    """
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    tb = math.tan(beta)
+    if abs(tb) < 1e-12:
+        raise ValueError("beta too small")
+
+    x_end_theory = (H - h1) / tb
+    x_end_eff = x_end_backoff_last_slice(x_end_theory, n, last_scale=last_slice_scale)
+
+    dx_nom = x_end_theory / n  # keep nominal dx for slices; last slice gets truncated by x_end_eff
+
+    def yb(x): return y_base_regimeA(x, h1, alpha, beta)
+    def yi(x): return y_int(x, h1, beta)
+
+    slices = []
+
+    for i in range(n):
+        x0 = i * dx_nom
+        x1 = min((i + 1) * dx_nom, x_end_eff)
+        if x1 <= x0 + 1e-12:
+            break
+
+        x_mid = 0.5*(x0 + x1)
+        a_local = base_angle_regimeA(x_mid, h1, alpha, beta)
+        cos_a = math.cos(a_local)
+        if abs(cos_a) < 1e-12:
+            raise ValueError("cos(base angle) too small (Regime A)")
+
+        # base length for cohesion term uses local base angle
+        L = (x1 - x0) / cos_a
+
+        # base moment arm point at slip-segment midpoint
+        x_base = x_mid
+        yb_base = yb(x_base)
+        if yb_base >= H:
+            continue
+
+        xs = np.linspace(x0, x1, x_samples_per_slice)
+
+        A_soil = A_lcc = 0.0
+        Mx_soil = My_soil = 0.0
+        Mx_lcc  = My_lcc  = 0.0
+
+        for j in range(len(xs) - 1):
+            xa = float(xs[j]); xb = float(xs[j+1])
+            xm = 0.5*(xa+xb)
+            dxx = xb - xa
+
+            yb_a, yb_b, yb_m = yb(xa), yb(xb), yb(xm)
+            yi_a, yi_b, yi_m = yi(xa), yi(xb), yi(xm)
+
+            def t_soil(yb_, yi_):
+                return max(0.0, min(H, yi_) - yb_)
+
+            def t_lcc(yb_, yi_):
+                return max(0.0, H - max(yi_, yb_))
+
+            ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+            tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+            As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+            Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+            Mx_soil += xm * As
+            Mx_lcc  += xm * Al
+
+            ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+            yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+            My_soil += ys * As
+            My_lcc  += yl * Al
+
+            A_soil += As
+            A_lcc  += Al
+
+        A_tot = A_soil + A_lcc
+        if A_tot <= 0.0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0.0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append({
+            "dx": float(x1 - x0),
+            "L": float(L),
+            "a": float(a_local),
+            "W": float(W),
+            "x": float(x_c),
+            "y": float(y_c),
+            "x_base": float(x_base),
+            "yb_base": float(yb_base),
+        })
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime A). Check inputs.")
+    return slices, x_end_theory, x_end_eff
+
+
+# -------------------------
+# MP march (boundary Pa at hps)
+# -------------------------
+
+def mp_march(FS: float, lam: float, slices, Pa: float, hps: float,
+             phi_deg: float, c_base: float, kh: float):
+    """
+    Returns (En, Mtot) about toe.
+    E is interslice normal (horizontal); X is interslice shear (vertical) via X = lam*f*E.
+    """
+    phi = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+
+    n = len(slices)
+    f = half_sine_f(n)
+
+    E = np.zeros(n + 1, dtype=float)
+    E[0] = Pa
+
+    # Global moment about toe: M = Σ (x*Fy - y*Fx)
+    Mtot = -Pa * hps
+
+    c_eff = c_base / FS
+    tan_eff = tan_phi / FS
+
+    for i, sl in enumerate(slices):
+        W  = sl["W"]
+        a  = sl["a"]
+        L  = sl["L"]
+
+        xC = sl["x"]
+        yC = sl["y"]
+
+        xB = sl["x_base"]
+        yB = sl["yb_base"]
+
+        cos_a = math.cos(a)
+        sin_a = math.sin(a)
+
+        # inertia (horizontal)
+        Fx_in = -kh * W
+
+        EiL = E[i]
+        XiL = lam * f[i] * EiL
+        fR  = f[i + 1]
+
+        # MP equilibrium:
+        # S = c_eff*L + N*tan_eff
+        # ΣFx: (EiL - EiR) + Fx_in + S*cos(a) - N*sin(a) = 0
+        # ΣFy: (XiL - XiR) - W     + S*sin(a) + N*cos(a) = 0
+        # XiR = lam*fR*EiR
+        A = (tan_eff * cos_a - sin_a)
+        B = (tan_eff * sin_a + cos_a)
+
+        rhs_const = (XiL - W + c_eff * L * sin_a)
+        lhs_const = lam * fR * (EiL + Fx_in + c_eff * L * cos_a)
+
+        denom = (lam * fR * A - B)
+        if abs(denom) < 1e-14:
+            return None
+
+        N = (rhs_const - lhs_const) / denom
+
+        EiR = EiL + Fx_in + c_eff * L * cos_a + N * A
+        E[i + 1] = EiR
+
+        # base reactions
+        S = c_eff * L + N * tan_eff
+        Fx_base = (-N * sin_a) + (S * cos_a)
+        Fy_base = ( N * cos_a) + (S * sin_a)
+
+        # moments:
+        Mtot += (-yC * Fx_in)                 # inertia (x*0 - y*Fx)
+        Mtot += (xC * (-W))                   # weight (x*Fy)
+        Mtot += (xB * Fy_base - yB * Fx_base) # base reaction at slip midpoint
+
+    En = float(E[-1])
+    return En, float(Mtot)
+
+
+# -------------------------
+# Solve lambda for given FS (scan bracket + bisection)
+# -------------------------
+
+def solve_lambda_for_FS(FS: float, slices, Pa: float, hps: float,
+                        phi_deg: float, c_base: float, kh: float,
+                        tol_En: float = 1e-8,
+                        lam_scan=(-200.0, 200.0, 4001),
+                        max_bisect: int = 120):
+    """
+    Robust lambda solve:
+    - scan lambda over [lam_min, lam_max] to find a sign change in En
+    - pick the bracket whose mid-lambda has smallest |lambda| (stable branch)
+    - bisection in that bracket
+
+    Returns (lambda, En, M, warn_flag)
+    """
+    lam_min, lam_max, npts = lam_scan
+    lams = np.linspace(lam_min, lam_max, int(npts), dtype=float)
+
+    En_vals = np.empty_like(lams)
+    M_vals  = np.empty_like(lams)
+
+    # evaluate scan
+    for k in range(len(lams)):
+        out = mp_march(FS, float(lams[k]), slices, Pa, hps, phi_deg, c_base, kh)
+        if out is None:
+            En_vals[k] = np.nan
+            M_vals[k]  = np.nan
+        else:
+            En_vals[k], M_vals[k] = out
+
+    # find sign-change intervals
+    brackets = []
+    for k in range(len(lams) - 1):
+        e0, e1 = En_vals[k], En_vals[k+1]
+        if not np.isfinite(e0) or not np.isfinite(e1):
+            continue
+        if e0 == 0.0:
+            return float(lams[k]), float(e0), float(M_vals[k]), False
+        if e0 * e1 < 0:
+            a = float(lams[k]); b = float(lams[k+1])
+            mid = 0.5*(a+b)
+            brackets.append((abs(mid), a, b))
+
+    if not brackets:
+        raise RuntimeError("Could not bracket lambda for En=0 (scan failed). Widen lam_scan or check inputs.")
+
+    # choose the most central root (smallest |mid|)
+    brackets.sort(key=lambda t: t[0])
+    _, lam_a, lam_b = brackets[0]
+
+    # bisection
+    out_a = mp_march(FS, lam_a, slices, Pa, hps, phi_deg, c_base, kh)
+    out_b = mp_march(FS, lam_b, slices, Pa, hps, phi_deg, c_base, kh)
+    if out_a is None or out_b is None:
+        raise RuntimeError("Lambda bracket endpoints invalid (mp_march returned None).")
+
+    En_a, _ = out_a
+    En_b, _ = out_b
+
+    warn = False
+    for _ in range(max_bisect):
+        lam_m = 0.5*(lam_a + lam_b)
+        out_m = mp_march(FS, lam_m, slices, Pa, hps, phi_deg, c_base, kh)
+        if out_m is None:
+            warn = True
+            # nudge
+            lam_m = 0.5*(lam_m + lam_a)
+            out_m = mp_march(FS, lam_m, slices, Pa, hps, phi_deg, c_base, kh)
+            if out_m is None:
+                break
+
+        En_m, M_m = out_m
+        if abs(En_m) < tol_En:
+            return float(lam_m), float(En_m), float(M_m), warn
+
+        if En_a * En_m < 0:
+            lam_b, En_b = lam_m, En_m
+        else:
+            lam_a, En_a = lam_m, En_m
+
+    # best effort
+    lam_m = 0.5*(lam_a + lam_b)
+    En_m, M_m = mp_march(FS, lam_m, slices, Pa, hps, phi_deg, c_base, kh)
+    return float(lam_m), float(En_m), float(M_m), True
+
+
+# -------------------------
+# Solve FS (outer) with lambda(FS) inside
+# -------------------------
+
+def solve_FS_trueMP(
+    slices,
+    Pa: float,
+    hps: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    FS_lo: float = 0.7,
+    FS_hi: float = 1.5,
+    tol_M: float = 1e-4,
+    max_iter: int = 70,
+    lam_scan=(-200.0, 200.0, 4001),
+):
+    """
+    Solve FS such that M(FS, lambda(FS)) = 0.
+    Returns dict with FS, lambda, En, M, flags.
+    """
+
+    def M_at_FS(FS):
+        lam, En, M, warn_lam = solve_lambda_for_FS(
+            FS, slices, Pa, hps, phi_deg, c_base, kh,
+            tol_En=1e-8, lam_scan=lam_scan, max_bisect=140
+        )
+        return M, lam, En, warn_lam
+
+    # initial
+    M0, lam0, En0, w0 = M_at_FS(FS_lo)
+    M1, lam1, En1, w1 = M_at_FS(FS_hi)
+
+    # expand bracket if needed
+    expand = 0
+    while M0 * M1 > 0 and expand < 14:
+        FS_lo *= 0.85
+        FS_hi *= 1.15
+        M0, lam0, En0, w0 = M_at_FS(FS_lo)
+        M1, lam1, En1, w1 = M_at_FS(FS_hi)
+        expand += 1
+
+    if M0 * M1 > 0:
+        # no bracket: return best-effort midpoint
+        FS_mid = 0.5*(FS_lo + FS_hi)
+        M_mid, lam_mid, En_mid, w_mid = M_at_FS(FS_mid)
+        return {
+            "FS": float(FS_mid),
+            "lam": float(lam_mid),
+            "En": float(En_mid),
+            "M": float(M_mid),
+            "lambda_warn": bool(w_mid),
+            "bracket_failed": True,
+            "details": "Moment root not bracketed in FS.",
+        }
+
+    # bisection in FS
+    for _ in range(max_iter):
+        FS_mid = 0.5*(FS_lo + FS_hi)
+        M_mid, lam_mid, En_mid, w_mid = M_at_FS(FS_mid)
+
+        if abs(M_mid) < tol_M or (FS_hi - FS_lo) < 1e-4:
+            return {
+                "FS": float(FS_mid),
+                "lam": float(lam_mid),
+                "En": float(En_mid),
+                "M": float(M_mid),
+                "lambda_warn": bool(w_mid),
+                "bracket_failed": False,
+                "details": "",
+            }
+
+        if M0 * M_mid < 0:
+            FS_hi, M1 = FS_mid, M_mid
+        else:
+            FS_lo, M0 = FS_mid, M_mid
+
+    # best effort
+    return {
+        "FS": float(FS_mid),
+        "lam": float(lam_mid),
+        "En": float(En_mid),
+        "M": float(M_mid),
+        "lambda_warn": bool(w_mid),
+        "bracket_failed": False,
+        "details": "FS max_iter reached.",
+    }
+# --- Add-on: iterate hps until FS≈1.0000 ±0.25% with Pa fixed ---
+# Drop this block into the same file (below solve_FS_trueMP and above __main__).
+
+def solve_hps_for_FS1(
+    slices,
+    Pa: float,
+    H: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    hps0: float,
+    tol_pct: float = 0.0025,         # ±0.25%
+    max_iter: int = 40,
+    hps_min_frac: float = 0.05,      # clamp search in [0.05H, 0.95H]
+    hps_max_frac: float = 0.95,
+    step_frac: float = 0.10,         # initial bracket expansion step = 0.10H
+    FS_scan_lo: float = 0.7,
+    FS_scan_hi: float = 1.5,
+    lam_scan=(-200.0, 200.0, 4001),
+):
+    """
+    Controller:
+      - Pa fixed
+      - Adjust hps until FS in [1-tol_pct, 1+tol_pct]
+
+    Strategy:
+      1) Evaluate FS at hps0.
+      2) Build a bracket [hps_lo,hps_hi] such that (FS-1) changes sign
+         by expanding upward/downward in steps.
+      3) Bisection in hps.
+
+    Direction assumption:
+      - We do NOT assume monotonic FS(hps) globally; we use sign-bracketing on g(h)=FS(h)-1.
+      - If we cannot find a sign bracket, we return best effort (closest |FS-1| found).
+    """
+
+    target_lo = 1.0 - tol_pct
+    target_hi = 1.0 + tol_pct
+
+    hps_min = hps_min_frac * H
+    hps_max = hps_max_frac * H
+
+    def eval_at(hps):
+        sol = solve_FS_trueMP(
+            slices=slices,
+            Pa=Pa,
+            hps=hps,
+            phi_deg=phi_deg,
+            c_base=c_base,
+            kh=kh,
+            FS_lo=FS_scan_lo,
+            FS_hi=FS_scan_hi,
+            tol_M=1e-4,
+            lam_scan=lam_scan,
+        )
+        FS = sol["FS"]
+        g  = FS - 1.0
+        return g, FS, sol
+
+    # 1) start evaluation
+    hps0 = clamp(hps0, hps_min, hps_max)
+    g0, FS0, sol0 = eval_at(hps0)
+
+    best = {
+        "hps": hps0,
+        "FS": FS0,
+        "g": g0,
+        "sol": sol0,
+        "iters": 0
+    }
+
+    if target_lo <= FS0 <= target_hi:
+        return best
+
+    # 2) find a sign bracket
+    # We'll expand both directions from hps0 in increments of step_frac*H
+    step = step_frac * H
+    hps_lo = hps0
+    hps_hi = hps0
+    g_lo = g0
+    g_hi = g0
+
+    # expand outward
+    for k in range(1, 1 + 20):
+        moved = False
+
+        # try down
+        cand_lo = max(hps_min, hps0 - k * step)
+        if cand_lo < hps_lo - 1e-12:
+            g_c, FS_c, sol_c = eval_at(cand_lo)
+            moved = True
+            hps_lo, g_lo = cand_lo, g_c
+            if abs(g_c) < abs(best["g"]):
+                best = {"hps": cand_lo, "FS": FS_c, "g": g_c, "sol": sol_c, "iters": 0}
+
+        # try up
+        cand_hi = min(hps_max, hps0 + k * step)
+        if cand_hi > hps_hi + 1e-12:
+            g_c, FS_c, sol_c = eval_at(cand_hi)
+            moved = True
+            hps_hi, g_hi = cand_hi, g_c
+            if abs(g_c) < abs(best["g"]):
+                best = {"hps": cand_hi, "FS": FS_c, "g": g_c, "sol": sol_c, "iters": 0}
+
+        # check bracket
+        if g_lo * g_hi < 0.0:
+            break
+
+        if not moved:
+            break  # hit both clamps
+
+    # If we couldn't bracket, return best effort
+    if not (g_lo * g_hi < 0.0):
+        best["note"] = "WARNING: could not bracket FS=1 within hps bounds; returning closest found."
+        return best
+
+    # Ensure lo/hi ordering
+    lo, hi = (hps_lo, hps_hi) if hps_lo < hps_hi else (hps_hi, hps_lo)
+    # Re-eval to get correct g signs at endpoints
+    g_lo, FS_lo, sol_lo = eval_at(lo)
+    g_hi, FS_hi, sol_hi = eval_at(hi)
+
+    # 3) bisection on hps
+    for it in range(1, max_iter + 1):
+        mid = 0.5 * (lo + hi)
+        g_m, FS_m, sol_m = eval_at(mid)
+
+        # update best
+        if abs(g_m) < abs(best["g"]):
+            best = {"hps": mid, "FS": FS_m, "g": g_m, "sol": sol_m, "iters": it}
+
+        # done?
+        if target_lo <= FS_m <= target_hi:
+            best["iters"] = it
+            return best
+
+        # bracket update
+        if g_lo * g_m < 0.0:
+            hi, g_hi = mid, g_m
+        else:
+            lo, g_lo = mid, g_m
+
+    best["note"] = "Max iterations reached; returning best encountered."
+    return best
+
+
+# --- Example usage inside __main__ (add after the MP solve block) ---
+# out_hps = solve_hps_for_FS1(
+#     slices=slices, Pa=Pa, H=H,
+#     phi_deg=phi_deg, c_base=c_base, kh=kh,
+#     hps0=hps,
+#     tol_pct=0.0025,
+#     max_iter=40,
+#     hps_min_frac=0.05, hps_max_frac=0.95,
+#     step_frac=0.10,
+#     FS_scan_lo=0.7, FS_scan_hi=1.5,
+#     lam_scan=(-200.0, 200.0, 4001),
+# )
+# print("\n--- hps -> FS≈1 controller ---")
+# print(f"hps={out_hps['hps']:.6f} ft  FS={out_hps['FS']:.6f}  g={out_hps['g']:+.6f}  iters={out_hps['iters']}")
+# if "note" in out_hps:
+#     print(out_hps["note"])
+# sol = out_hps["sol"]
+# print(f"lam={sol['lam']:+.6f} En={sol['En']:+.3e} M={sol['M']:+.3e} lambda_warn={sol['lambda_warn']} bracket_failed={sol['bracket_failed']}")
+
+# -------------------------
+# Convenience: build slices with auto regime switch
+# -------------------------
+
+def build_slices_auto(
+    n: int,
+    H: float,
+    h1: float,
+    h2: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float,
+    gamma_lcc: float,
+    x_samples_per_slice: int = 120,
+    last_slice_scale_A: float = 0.9999,
+):
+    reg = choose_regime(alpha_deg, h1, h2, beta_deg)
+
+    if reg == "A":
+        slices, x_end_theory, x_end_eff = build_slices_regimeA_bilinear_exact(
+            n=n, H=H, h1=h1,
+            alpha_deg=alpha_deg, beta_deg=beta_deg,
+            gamma_soil=gamma_soil, gamma_lcc=gamma_lcc,
+            x_samples_per_slice=x_samples_per_slice,
+            last_slice_scale=last_slice_scale_A
+        )
+        return reg, slices, {"x_end_theory": x_end_theory, "x_end_eff": x_end_eff}
+
+    slices, x_end = build_slices_regimeB_singleplane_exact(
+        n=n, H=H, h1=h1,
+        alpha_deg=alpha_deg, beta_deg=beta_deg,
+        gamma_soil=gamma_soil, gamma_lcc=gamma_lcc,
+        x_samples_per_slice=x_samples_per_slice
+    )
+    return reg, slices, {"x_end": x_end}
+
+
+# -------------------------
+# Example test harness
+# -------------------------
+
+if __name__ == "__main__":
+    # Example values (edit to match your cases)
+    H = 38.0
+    h1 = 3.0
+    h2 = H - h1
+
+    alpha_deg = 31.26
+    beta_deg  = 26.57
+
+    gamma_soil = 120.0
+    gamma_lcc  = 40.0
+
+    Pa  = 8391.0
+    hps = 19.0
+
+    phi_deg = 30.0
+    c_base  = 0.0     # set >0 to test cohesion
+    kh      = 0.16
+
+    n_slices = 50
+
+    reg, slices, geom = build_slices_auto(
+        n=n_slices, H=H, h1=h1, h2=h2,
+        alpha_deg=alpha_deg, beta_deg=beta_deg,
+        gamma_soil=gamma_soil, gamma_lcc=gamma_lcc,
+        x_samples_per_slice=160,
+        last_slice_scale_A=0.9999
+    )
+
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    print(f"alpha_crit={acrit:.6f} deg | alpha={alpha_deg:.6f} deg -> Regime {reg}")
+    print(f"Geometry info: {geom}")
+    print(f"Slices: {len(slices)}")
+
+    sol = solve_FS_trueMP(
+        slices=slices, Pa=Pa, hps=hps,
+        phi_deg=phi_deg, c_base=c_base, kh=kh,
+        FS_lo=0.7, FS_hi=1.5,
+        tol_M=1e-4,
+        lam_scan=(-200.0, 200.0, 4001),
+    )
+
+    print("\n--- MP solve ---")
+    print(f"FS   = {sol['FS']:.6f}")
+    print(f"lam  = {sol['lam']:+.6f}")
+    print(f"En   = {sol['En']:+.3e}")
+    print(f"M    = {sol['M']:+.3e}")
+    print(f"lambda_warn={sol['lambda_warn']} bracket_failed={sol['bracket_failed']} details={sol['details']}")
