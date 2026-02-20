@@ -1,0 +1,526 @@
+# -*- coding: utf-8 -*-
+"""
+MP_GLE_MP_RunFix_v4.py
+Generated: 2026-02-20
+
+Robust Morgenstern–Price / GLE implementation for Regime A (bilinear base)
+and Regime B (single-plane base), with a numerically stable nested solution:
+
+  (1) For a given lambda, solve FS so En(FS,lambda)=0
+  (2) Solve lambda so M(FS(lambda),lambda)=0
+
+This avoids failure modes where En is numerically insensitive to lambda.
+
+See inline comments for full sign conventions and force/moment definitions.
+"""
+
+import math
+import numpy as np
+
+# -------------------------
+# Helpers
+# -------------------------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def half_sine_f(n: int) -> np.ndarray:
+    idx = np.arange(n + 1, dtype=float)
+    return np.sin(np.pi * idx / n)  # f[0]=f[n]=0
+
+# -------------------------
+# Regime switch
+# -------------------------
+def alpha_critical_deg(h1: float, h2: float, beta_deg: float) -> float:
+    if h2 <= 0:
+        raise ValueError("h2 must be > 0")
+    beta = math.radians(beta_deg)
+    val = ((h1 + h2) * math.tan(beta)) / h2
+    return math.degrees(math.atan(val))
+
+def choose_regime(alpha_deg: float, h1: float, h2: float, beta_deg: float) -> str:
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    return "A" if alpha_deg > acrit else "B"
+
+# -------------------------
+# Geometry primitives
+# -------------------------
+def y_base_regimeB(x: float, alpha_rad: float) -> float:
+    return x * math.tan(alpha_rad)
+
+def y_base_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    return min(x * math.tan(alpha_rad), h1 + x * math.tan(beta_rad))
+
+def base_angle_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    ya = x * math.tan(alpha_rad)
+    yb = h1 + x * math.tan(beta_rad)
+    return alpha_rad if ya <= yb else beta_rad
+
+def x_end_backoff_last_slice(x_end_theory: float, n: int, last_scale: float = 0.9999) -> float:
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not (0.0 < last_scale < 1.0):
+        raise ValueError("last_scale must be in (0,1)")
+    dx = x_end_theory / n
+    return x_end_theory - (1.0 - last_scale) * dx
+
+# -------------------------
+# Slice integration (exact-ish in x)
+# -------------------------
+def _integrate_slice_materials(x0, x1, H, h1, beta, yb_func, x_samples):
+    """Integrate soil/LCC areas and first moments over [x0,x1]."""
+    xs = np.linspace(x0, x1, int(x_samples))
+    A_soil = A_lcc = 0.0
+    Mx_soil = My_soil = 0.0
+    Mx_lcc  = My_lcc  = 0.0
+    tb = math.tan(beta)
+
+    def t_soil(yb_, yi_):
+        return max(0.0, min(H, yi_) - yb_)
+
+    def t_lcc(yb_, yi_):
+        return max(0.0, H - max(yi_, yb_))
+
+    for j in range(len(xs) - 1):
+        xa = float(xs[j]); xb = float(xs[j+1])
+        xm = 0.5*(xa+xb)
+        dxx = xb - xa
+
+        yb_a, yb_b, yb_m = yb_func(xa), yb_func(xb), yb_func(xm)
+        yi_a, yi_b, yi_m = (h1 + xa*tb), (h1 + xb*tb), (h1 + xm*tb)
+
+        ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+        tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+        As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+        Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+        Mx_soil += xm * As
+        Mx_lcc  += xm * Al
+
+        ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+        yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+        My_soil += ys * As
+        My_lcc  += yl * Al
+
+        A_soil += As
+        A_lcc  += Al
+
+    return A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc
+
+# -------------------------
+# Slice builders
+# -------------------------
+def build_slices_regimeB_singleplane_exact(
+    n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc, x_samples_per_slice=120
+):
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    ta = math.tan(alpha)
+    if abs(ta) < 1e-12:
+        raise ValueError("alpha too small")
+    x_end = H / ta
+    dx = x_end / n
+    cos_a = math.cos(alpha)
+    if abs(cos_a) < 1e-12:
+        raise ValueError("cos(alpha) too small")
+    L_nom = dx / cos_a
+
+    def yb(x): return y_base_regimeB(x, alpha)
+
+    slices = []
+    for i in range(n):
+        x0 = i*dx
+        x1 = (i+1)*dx
+        x_mid = 0.5*(x0+x1)
+        yb_mid = yb(x_mid)
+        if yb_mid >= H:
+            continue
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(dx), L=float(L_nom), a=float(alpha),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(x_mid), yb_base=float(yb_mid),
+        ))
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime B).")
+    return slices, x_end
+
+def build_slices_regimeA_bilinear_exact(
+    n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+    x_samples_per_slice=120, last_slice_scale=0.9999
+):
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    tb = math.tan(beta)
+    if abs(tb) < 1e-12:
+        raise ValueError("beta too small")
+    x_end_theory = (H - h1) / tb
+    x_end_eff = x_end_backoff_last_slice(x_end_theory, n, last_scale=last_slice_scale)
+    dx_nom = x_end_theory / n
+
+    def yb(x): return y_base_regimeA(x, h1, alpha, beta)
+
+    slices = []
+    for i in range(n):
+        x0 = i*dx_nom
+        x1 = min((i+1)*dx_nom, x_end_eff)
+        if x1 <= x0 + 1e-12:
+            break
+
+        x_mid = 0.5*(x0+x1)
+        yb_mid = yb(x_mid)
+        if yb_mid >= H:
+            continue
+
+        a_local = base_angle_regimeA(x_mid, h1, alpha, beta)
+        cos_a = math.cos(a_local)
+        if abs(cos_a) < 1e-12:
+            raise ValueError("cos(base angle) too small (Regime A)")
+        L = (x1-x0) / cos_a
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(x1-x0), L=float(L), a=float(a_local),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(x_mid), yb_base=float(yb_mid),
+        ))
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime A).")
+    return slices, x_end_theory, x_end_eff
+
+def build_slices_auto(
+    n, H, h1, h2, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+    x_samples_per_slice=120, last_slice_scale_A=0.9999
+):
+    reg = choose_regime(alpha_deg, h1, h2, beta_deg)
+    if reg == "A":
+        slices, x_end_theory, x_end_eff = build_slices_regimeA_bilinear_exact(
+            n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+            x_samples_per_slice=x_samples_per_slice,
+            last_slice_scale=last_slice_scale_A
+        )
+        return reg, slices, dict(x_end_theory=x_end_theory, x_end_eff=x_end_eff)
+    slices, x_end = build_slices_regimeB_singleplane_exact(
+        n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+        x_samples_per_slice=x_samples_per_slice
+    )
+    return reg, slices, dict(x_end=x_end)
+
+# -------------------------
+# MP march
+# -------------------------
+def mp_march(FS, lam, slices, Pa, hps, phi_deg, c_base, kh):
+    """Return (En, Mtot) about toe."""
+    phi = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+
+    n = len(slices)
+    f = half_sine_f(n)
+
+    E = np.zeros(n+1, dtype=float)
+    E[0] = Pa
+
+    Mtot = -Pa * hps
+
+    c_eff = c_base / FS
+    tan_eff = tan_phi / FS
+
+    for i, sl in enumerate(slices):
+        W = sl["W"]; a = sl["a"]; L = sl["L"]
+        xC = sl["x"]; yC = sl["y"]
+        xB = sl["x_base"]; yB = sl["yb_base"]
+
+        cos_a = math.cos(a); sin_a = math.sin(a)
+
+        Fx_in = -kh * W
+
+        EiL = E[i]
+        XiL = lam * f[i] * EiL
+        fR  = f[i+1]
+
+        A = (tan_eff * cos_a - sin_a)
+        B = (tan_eff * sin_a + cos_a)
+
+        rhs_const = (XiL - W + c_eff*L*sin_a)
+        lhs_const = lam * fR * (EiL + Fx_in + c_eff*L*cos_a)
+
+        denom = (lam*fR*A - B)
+        if abs(denom) < 1e-14:
+            return None
+
+        N = (rhs_const - lhs_const) / denom
+
+        EiR = EiL + Fx_in + c_eff*L*cos_a + N*A
+        E[i+1] = EiR
+
+        S = c_eff*L + N*tan_eff
+        Fx_base = (-N*sin_a) + (S*cos_a)
+        Fy_base = ( N*cos_a) + (S*sin_a)
+
+        Mtot += (-yC*Fx_in)
+        Mtot += (xC*(-W))
+        Mtot += (xB*Fy_base - yB*Fx_base)
+
+    return float(E[-1]), float(Mtot)
+
+# -------------------------
+# Inner solve: given lambda -> FS such that En=0
+# -------------------------
+def solve_FS_for_lambda(
+    lam, slices, Pa, hps, phi_deg, c_base, kh,
+    FS_lo=0.2, FS_hi=5.0, tol_En=1e-8, max_iter=120
+):
+    def En_at(FS):
+        out = mp_march(FS, lam, slices, Pa, hps, phi_deg, c_base, kh)
+        if out is None:
+            return None
+        return out[0], out[1]
+
+    a, b = FS_lo, FS_hi
+    eva = En_at(a); evb = En_at(b)
+    expand = 0
+    while (eva is None or evb is None or eva[0]*evb[0] > 0) and expand < 20:
+        a *= 0.7
+        b *= 1.3
+        eva = En_at(a); evb = En_at(b)
+        expand += 1
+    if eva is None or evb is None or eva[0]*evb[0] > 0:
+        raise RuntimeError("Could not bracket FS for En=0 at this lambda.")
+
+    En_a = eva[0]
+    for _ in range(max_iter):
+        m = 0.5*(a+b)
+        evm = En_at(m)
+        if evm is None:
+            m = 0.5*(m+a)
+            evm = En_at(m)
+            if evm is None:
+                break
+        En_m, M_m = evm
+        if abs(En_m) < tol_En:
+            return float(m), float(En_m), float(M_m)
+        if En_a*En_m < 0:
+            b = m
+        else:
+            a = m
+            En_a = En_m
+
+    m = 0.5*(a+b)
+    En_m, M_m = En_at(m)
+    return float(m), float(En_m), float(M_m)
+
+# -------------------------
+# Outer solve: lambda such that M(FS(lambda),lambda)=0
+# -------------------------
+def solve_MP_true(
+    slices, Pa, hps, phi_deg, c_base, kh,
+    lam_scan=(-200.0, 200.0, 401), tol_M=1e-4, max_iter=80
+):
+    lam_min, lam_max, npts = lam_scan
+    lams = np.linspace(lam_min, lam_max, int(npts), dtype=float)
+
+    vals = []
+    for lam in lams:
+        try:
+            FS, En, M = solve_FS_for_lambda(lam, slices, Pa, hps, phi_deg, c_base, kh)
+            vals.append((float(lam), FS, En, M))
+        except Exception:
+            vals.append((float(lam), math.nan, math.nan, math.nan))
+
+    brackets = []
+    for i in range(len(vals)-1):
+        lam0, FS0, En0, M0 = vals[i]
+        lam1, FS1, En1, M1 = vals[i+1]
+        if not (math.isfinite(M0) and math.isfinite(M1)):
+            continue
+        if M0 == 0.0:
+            return dict(FS=FS0, lam=lam0, En=En0, M=M0, bracket_failed=False, note="Exact M=0 on scan.")
+        if M0*M1 < 0:
+            mid = 0.5*(lam0+lam1)
+            brackets.append((abs(mid), lam0, lam1))
+
+    if not brackets:
+        finite = [v for v in vals if math.isfinite(v[3])]
+        if not finite:
+            raise RuntimeError("Lambda scan produced no valid points.")
+        lam_best, FS_best, En_best, M_best = min(finite, key=lambda t: abs(t[3]))
+        return dict(FS=FS_best, lam=lam_best, En=En_best, M=M_best, bracket_failed=True,
+                    note="Could not bracket M=0 in lambda scan; returning smallest |M| point.")
+
+    brackets.sort(key=lambda t: t[0])
+    _, a, b = brackets[0]
+
+    def Mstar(lam):
+        return solve_FS_for_lambda(lam, slices, Pa, hps, phi_deg, c_base, kh)
+
+    FS_a, En_a, M_a = Mstar(a)
+    for _ in range(max_iter):
+        m = 0.5*(a+b)
+        FS_m, En_m, M_m = Mstar(m)
+        if abs(M_m) < tol_M or abs(b-a) < 1e-6:
+            return dict(FS=FS_m, lam=float(m), En=En_m, M=M_m, bracket_failed=False, note="")
+        if M_a*M_m < 0:
+            b = m
+        else:
+            a = m
+            M_a = M_m
+
+    m = 0.5*(a+b)
+    FS_m, En_m, M_m = Mstar(m)
+    return dict(FS=FS_m, lam=float(m), En=En_m, M=M_m, bracket_failed=False, note="lambda max_iter reached.")
+
+# -------------------------
+# hps controller: adjust hps so FS≈1 ±0.25% with Pa fixed
+# -------------------------
+def solve_hps_for_FS1(
+    slices, Pa, H, phi_deg, c_base, kh, hps0,
+    tol_pct=0.0025, max_iter=35, hps_min_frac=0.05, hps_max_frac=0.95, step_frac=0.10,
+    lam_scan=(-200.0, 200.0, 401)
+):
+    target_lo = 1.0 - tol_pct
+    target_hi = 1.0 + tol_pct
+    hps_min = hps_min_frac*H
+    hps_max = hps_max_frac*H
+    hps0 = clamp(hps0, hps_min, hps_max)
+
+    def eval_at(hps):
+        sol = solve_MP_true(slices, Pa, hps, phi_deg, c_base, kh, lam_scan=lam_scan)
+        FS = sol["FS"]
+        return FS-1.0, FS, sol
+
+    g0, FS0, sol0 = eval_at(hps0)
+    best = dict(hps=hps0, FS=FS0, g=g0, sol=sol0, iters=0)
+    if target_lo <= FS0 <= target_hi:
+        return best
+
+    step = step_frac*H
+    lo = hi = hps0
+    g_lo = g_hi = g0
+
+    for k in range(1, 21):
+        cand = max(hps_min, hps0 - k*step)
+        if cand < lo - 1e-12:
+            g, FS, sol = eval_at(cand)
+            lo, g_lo = cand, g
+            if abs(g) < abs(best["g"]):
+                best = dict(hps=cand, FS=FS, g=g, sol=sol, iters=0)
+
+        cand = min(hps_max, hps0 + k*step)
+        if cand > hi + 1e-12:
+            g, FS, sol = eval_at(cand)
+            hi, g_hi = cand, g
+            if abs(g) < abs(best["g"]):
+                best = dict(hps=cand, FS=FS, g=g, sol=sol, iters=0)
+
+        if g_lo*g_hi < 0:
+            break
+
+    if not (g_lo*g_hi < 0):
+        best["note"] = "WARNING: could not bracket FS=1 within hps bounds; returning closest found."
+        return best
+
+    a, b = lo, hi
+    ga, _, _ = eval_at(a)
+    for it in range(1, max_iter+1):
+        m = 0.5*(a+b)
+        gm, FS, sol = eval_at(m)
+        if abs(gm) < abs(best["g"]):
+            best = dict(hps=m, FS=FS, g=gm, sol=sol, iters=it)
+        if target_lo <= FS <= target_hi:
+            best["iters"] = it
+            return best
+        if ga*gm < 0:
+            b = m
+        else:
+            a = m
+            ga = gm
+
+    best["note"] = "Max iterations reached; returning best encountered."
+    return best
+
+if __name__ == "__main__":
+    # Quick self-test / example
+    H = 38.0
+    h1 = 3.0
+    h2 = 35.0
+
+    beta_deg = 33.69
+    alpha_deg = 32.65
+
+    gamma_soil = 120.0
+    gamma_lcc  = 40.0
+
+    Pa  = 3950.0
+    hps = 19.0
+
+    phi_deg = 30.0
+    c_base  = 200.0
+    kh      = 0.16
+
+    n_slices = 50
+
+    reg, slices, geom = build_slices_auto(
+        n=n_slices, H=H, h1=h1, h2=h2,
+        alpha_deg=alpha_deg, beta_deg=beta_deg,
+        gamma_soil=gamma_soil, gamma_lcc=gamma_lcc,
+        x_samples_per_slice=120,
+        last_slice_scale_A=0.9999
+    )
+
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    print(f"alpha_crit={acrit:.6f} deg | alpha={alpha_deg:.6f} deg -> Regime {reg}")
+    print(f"Geometry: {geom} | slices={len(slices)}")
+
+    sol = solve_MP_true(
+        slices=slices, Pa=Pa, hps=hps,
+        phi_deg=phi_deg, c_base=c_base, kh=kh,
+        lam_scan=(-200.0, 200.0, 401)
+    )
+
+    print("\n--- MP solve (nested) ---")
+    print(f"FS   = {sol['FS']:.6f}")
+    print(f"lam  = {sol['lam']:+.6f}")
+    print(f"En   = {sol['En']:+.3e}")
+    print(f"M    = {sol['M']:+.3e}")
+    print(f"bracket_failed={sol['bracket_failed']}")
+    if sol.get("note"):
+        print(sol["note"])
+
+    out_hps = solve_hps_for_FS1(
+        slices=slices, Pa=Pa, H=H,
+        phi_deg=phi_deg, c_base=c_base, kh=kh,
+        hps0=hps, tol_pct=0.0025, max_iter=35,
+        lam_scan=(-200.0, 200.0, 401)
+    )
+    print("\n--- hps controller (Pa fixed) ---")
+    print(f"hps={out_hps['hps']:.6f} ft  FS={out_hps['FS']:.6f}  g={out_hps['g']:+.6f}  iters={out_hps['iters']}")
+    if "note" in out_hps:
+        print(out_hps["note"])
