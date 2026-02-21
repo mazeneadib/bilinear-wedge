@@ -1,0 +1,348 @@
+# -*- coding: utf-8 -*-
+"""
+GLE / Morgenstern–Price (half-sine) with wall lateral pressure in two boundary conventions:
+
+A) mode='slide2_reporting' (mirrors Slide2 reporting):
+   - Unknown boundary variable is E0 (reported Left Side Normal Force).
+   - Wall resultant Pa is NOT put on any slice; it enters ΣFx explicitly:
+         ΣFx = (E0 - En) + Σ(Fx_inertia + Fx_base) + Pa = 0
+   - Wall moment is included ONCE:  Mtot += -Ma  (about the toe).
+   - Left Side Shear at the wall is zero automatically with half-sine (f(0)=0).
+
+B) mode='net' (research/useful cross-check):
+   - Unknown boundary variable is dE0; we use E0_eff = Pa + dE0 as the boundary normal in ΣFx:
+         ΣFx = (E0_eff - En) + Σ(Fx_inertia + Fx_base) = 0
+   - Mtot += -Ma once (same).
+
+Strength reduction ONLY: c -> c/FS, tanφ -> tanφ/FS.
+
+Unknowns solved simultaneously from:
+    En = 0,  ΣM = 0,  ΣFx = 0
+via a 3-D trust-region Levenberg–Marquardt with residual scaling [En, ΣM/H, ΣFx].
+
+USAGE (see __main__ section below for examples):
+    - Build slices with build_slices_regimeB(...)
+    - Call solve_case_boundary(..., mode='slide2_reporting', starts=[...])
+    - Report FS, lambda, and (E0_reported if slide2_reporting) or (E0_eff if net)
+"""
+
+from __future__ import annotations
+import math
+import numpy as np
+from typing import Tuple, Optional, Dict, List
+
+# -----------------------
+# Helpers & math
+# -----------------------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def half_sine_f(n: int) -> np.ndarray:
+    i = np.arange(n+1, dtype=float)
+    return np.sin(np.pi * i / n)  # f[0]=f[n]=0
+
+def y_base_regimeB(x: float, alpha_rad: float) -> float:
+    return x * math.tan(alpha_rad)
+
+# -----------------------
+# Cross-section integration for weights
+# -----------------------
+def _integrate_slice_materials(x0: float, x1: float, H: float, h1: float,
+                               beta: float, yb_func, x_samples: int
+                               ) -> Tuple[float,float,float,float,float,float]:
+    xs = np.linspace(x0, x1, int(x_samples))
+    tb = math.tan(beta)
+    A_soil = A_lcc = 0.0
+    Mx_soil = My_soil = 0.0
+    Mx_lcc  = My_lcc  = 0.0
+
+    def t_soil(yb_, yi_): return max(0.0, min(H, yi_) - yb_)
+    def t_lcc (yb_, yi_): return max(0.0, H - max(yi_, yb_))
+
+    for j in range(len(xs) - 1):
+        xa = float(xs[j]); xb = float(xs[j+1])
+        xm = 0.5*(xa+xb); dxx = xb - xa
+
+        yb_a, yb_b, yb_m = yb_func(xa), yb_func(xb), yb_func(xm)
+        yi_a, yi_b, yi_m = (h1 + xa*tb), (h1 + xb*tb), (h1 + xm*tb)
+
+        ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+        tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+        As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+        Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+        Mx_soil += xm * As
+        Mx_lcc  += xm * Al
+
+        ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+        yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+        My_soil += ys * As
+        My_lcc  += yl * Al
+
+        A_soil += As
+        A_lcc  += Al
+
+    return A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc
+
+# -----------------------
+# Slices (Regime B)
+# -----------------------
+def build_slices_regimeB(n: int, H: float, h1: float, alpha_deg: float, beta_deg: float,
+                         gamma_soil: float, gamma_lcc: float, x_samples_per_slice: int=1000
+                         ) -> List[dict]:
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    ta    = math.tan(alpha)
+    x_end = H / ta
+    dx    = x_end / n
+    L_nom = dx / math.cos(alpha)
+    def yb(x): return y_base_regimeB(x, alpha)
+
+    slices: List[dict] = []
+    for i in range(n):
+        x0=i*dx; x1=(i+1)*dx; xm=0.5*(x0+x1)
+        yb_mid = yb(xm)
+        if yb_mid >= H: continue
+        As, Al, Mxs, Mys, Mxl, Myl = _integrate_slice_materials(x0,x1,H,h1,beta,yb,x_samples_per_slice)
+        if (As + Al) <= 0: continue
+        W = gamma_soil*As + gamma_lcc*Al
+        if W <= 0: continue
+        x_c = (gamma_soil*Mxs + gamma_lcc*Mxl)/W
+        y_c = (gamma_soil*Mys + gamma_lcc*Myl)/W
+        slices.append(dict(dx=float(dx), L=float(L_nom), a=float(alpha),
+                           W=float(W), x=float(x_c), y=float(y_c),
+                           x_base=float(xm), yb_base=float(yb_mid)))
+    if len(slices) != n:
+        raise RuntimeError("Unexpected number of slices built.")
+    return slices
+
+# -----------------------
+# Marcher (two conventions)
+# -----------------------
+# mode = 'slide2_reporting' => unknown bvar is E0 (reported Left Side Normal). ΣFx adds +Pa explicitly.
+# mode = 'net'              => unknown bvar is dE0; uses E0_eff = Pa + dE0 in ΣFx.
+def mp_march_boundary(FS: float, lam: float, bvar: float, slices: List[dict],
+                      Pa: float, Ma: float, phi_deg: float, c_base: float,
+                      kh: float, mode: str) -> Optional[np.ndarray]:
+    phi     = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+    n       = len(slices)
+    f       = half_sine_f(n)
+
+    E = np.zeros(n+1, dtype=float)
+    if mode == 'slide2_reporting':
+        E0 = float(bvar)           # reported Left Side Normal
+        E[0] = E0
+    elif mode == 'net':
+        dE0 = float(bvar)
+        E[0] = float(Pa) + dE0     # E0_eff
+    else:
+        raise ValueError("mode must be 'slide2_reporting' or 'net'")
+
+    Mtot = -float(Ma)              # include wall moment once
+
+    c_eff   = float(c_base) / float(FS)
+    tan_eff = float(tan_phi) / float(FS)
+
+    sum_Fx_in   = 0.0
+    sum_Fx_base = 0.0
+
+    for i, sl in enumerate(slices):
+        W, a, L = sl["W"], sl["a"], sl["L"]
+        xC, yC  = sl["x"], sl["y"]
+        xB, yB  = sl["x_base"], sl["yb_base"]
+        cos_a, sin_a = math.cos(a), math.sin(a)
+
+        Fx_in = -kh * W            # inertia only; NO Pa on slices
+        sum_Fx_in += Fx_in
+
+        EiL = E[i]
+        XiL = lam * f[i] * EiL
+        fR  = f[i+1]
+
+        A = (tan_eff * cos_a - sin_a)
+        B = (tan_eff * sin_a + cos_a)
+
+        rhs_const = (XiL - W + c_eff*L*sin_a)
+        lhs_const = lam * fR * (EiL + Fx_in + c_eff*L*cos_a)
+
+        denom = (lam*fR*A - B)
+        if abs(denom) < 1e-12:
+            return None  # avoid near-singular step
+
+        N = (rhs_const - lhs_const) / denom
+        EiR = EiL + Fx_in + c_eff*L*cos_a + N*A
+        E[i+1] = EiR
+
+        S = c_eff*L + N*tan_eff
+        Fx_base = (-N*sin_a) + (S*cos_a)
+        Fy_base = ( N*cos_a) + (S*sin_a)
+        sum_Fx_base += Fx_base
+
+        # Moments about toe: inertia + weight + base
+        Mtot += (-yC * (-kh * W))  # inertia
+        Mtot += ( xC * (-(W)) )    # weight
+        Mtot += ( xB*Fy_base - yB*Fx_base )
+
+    En = float(E[-1])
+    if mode == 'slide2_reporting':
+        E0 = float(bvar)
+        Fx_res = (E0 - En) + sum_Fx_in + sum_Fx_base + float(Pa)
+    else:
+        E0_eff = float(E[0])
+        Fx_res = (E0_eff - En) + sum_Fx_in + sum_Fx_base
+
+    return np.array([En, Mtot, Fx_res], float)
+
+# -----------------------
+# 3D trust‑region LM on (FS, lambda, bvar) with residual scaling
+# -----------------------
+def solve_3d_LM_boundary(slices: List[dict], Pa: float, Ma: float, phi_deg: float, c_base: float, kh: float,
+                         H: float, mode: str, x0=(1.0,-1.0,0.0), max_iter=260, verbose=False) -> Dict[str,float]:
+    FS, lam, bvar = map(float, x0)
+    Lc = max(1.0, H)   # scale M into 'force' units
+    mu = 1e-2          # initial damping
+
+    for it in range(1, max_iter+1):
+        r = mp_march_boundary(FS, lam, bvar, slices, Pa, Ma, phi_deg, c_base, kh, mode)
+        if r is None:
+            # nudge lambda and retry if marcher was singular
+            lam += 0.4
+            r = mp_march_boundary(FS, lam, bvar, slices, Pa, Ma, phi_deg, c_base, kh, mode)
+            if r is None:
+                lam -= 0.8
+                r = mp_march_boundary(FS, lam, bvar, slices, Pa, Ma, phi_deg, c_base, kh, mode)
+                if r is None:
+                    raise RuntimeError("march singular near iterate")
+        En, M, Fx = map(float, r)
+        rr = np.array([En, M/Lc, Fx], float)
+
+        if verbose:
+            print(f"[{it:03d}] FS={FS:.9f} lam={lam:.9f} b={bvar:.2f} | En={En:.3e} M={M:.3e} Fx={Fx:.3e}")
+
+        # Tight convergence
+        if abs(En) < 5e-12 and abs(M) < 5e-9 and abs(Fx) < 5e-12:
+            out = dict(FS=FS, lam=lam, En=En, M=M, Fx=Fx, iters=it, mode=mode)
+            if mode == 'slide2_reporting':
+                out['E0_reported'] = float(bvar)
+            else:
+                out['dE0'] = float(bvar)
+                out['E0_eff'] = float(Pa + bvar)
+            return out
+
+        # 3x3 FD Jacobian with scaling
+        steps = np.array([
+            1e-5*max(1.0, abs(FS)),
+            1e-3*max(1.0, abs(lam)),
+            1e-2*max(1000.0, abs(Pa), abs(bvar)+100.0)
+        ], float)
+        J = np.zeros((3,3), float)
+        base = np.array([FS, lam, bvar], float)
+        for k in range(3):
+            d = float(steps[k])
+            xk = base.copy(); xk[k] = xk[k] + d
+            rk = mp_march_boundary(xk[0], xk[1], xk[2], slices, Pa, Ma, phi_deg, c_base, kh, mode)
+            if rk is None:
+                d *= 10.0
+                xk = base.copy(); xk[k] = xk[k] + d
+                rk = mp_march_boundary(xk[0], xk[1], xk[2], slices, Pa, Ma, phi_deg, c_base, kh, mode)
+                if rk is None:
+                    raise RuntimeError("Jacobian eval failed")
+            dr = np.array([rk[0]-En, (rk[1]-M)/Lc, rk[2]-Fx], float)/d
+            J[:,k] = dr
+
+        # LM step: (J^T J + mu I) dx = -J^T r
+        JTJ = J.T @ J
+        g   = J.T @ rr
+        I   = np.eye(3)
+        for _ in range(6):
+            try:
+                dx = np.linalg.solve(JTJ + mu*I, -g)
+                break
+            except np.linalg.LinAlgError:
+                mu *= 10.0
+
+        # backtracking
+        step=1.0; improved=False
+        m0 = float(np.sum(np.abs(rr)))
+        for _ in range(14):
+            FS_t  = clamp(FS  + step*dx[0], 0.2, 10.0)
+            lam_t = clamp(lam + step*dx[1], -2000.0, 2000.0)
+            b_t   = bvar + step*dx[2]
+            rt = mp_march_boundary(FS_t, lam_t, b_t, slices, Pa, Ma, phi_deg, c_base, kh, mode)
+            if rt is not None:
+                En_t, M_t, Fx_t = map(float, rt)
+                merit = abs(En_t) + abs(M_t/Lc) + abs(Fx_t)
+                if merit < m0*(1 - 1e-3):
+                    FS, lam, bvar = FS_t, lam_t, b_t
+                    mu = max(1e-7, mu/3.0)
+                    improved=True
+                    break
+            step *= 0.5
+        if not improved:
+            mu = min(1e6, mu*4.0)
+
+    raise RuntimeError("Max iterations without convergence (3D LM)")
+
+# -----------------------
+# Multi‑start wrapper
+# -----------------------
+def solve_case_boundary(slices: List[dict], Pa: float, Ma: float, phi_deg: float, c_base: float, kh: float,
+                        H: float, mode: str, starts: List[tuple]) -> Dict[str,float]:
+    best = None
+    for x0 in starts:
+        try:
+            sol = solve_3d_LM_boundary(slices, Pa, Ma, phi_deg, c_base, kh, H, mode, x0=x0, max_iter=260, verbose=False)
+            score = abs(sol['En']) + abs(sol['M'])/max(1.0,H) + abs(sol['Fx'])
+            if (best is None) or (score < best[0]):
+                best = (score, sol)
+        except Exception:
+            continue
+    if best is None:
+        raise RuntimeError(f"All starts failed for mode={mode}")
+    return best[1]
+
+# -----------------------
+# Example (if run as script)
+# -----------------------
+if __name__ == "__main__":
+    # Common data
+    H, h1, beta_deg = 38.0, 3.0, 33.69
+    phi_deg, c_base, kh = 30.0, 200.0, 0.16
+    n, gamma_soil, gamma_lcc = 2, 120.0, 40.0
+
+    # --- Case A: Uniform (Slide2 reporting) ---
+    alphaA = 38.8943
+    slicesA = build_slices_regimeB(n, H, h1, alphaA, beta_deg, gamma_soil, gamma_lcc, 1000)
+    p0 = 103.9
+    PaA = p0 * H
+    MaA = p0 * H * H / 2.0
+
+    # Good starts for Slide2 parity: FS≈1, lambda≈(-1 to 0), E0≈Pa
+    startsA = [
+        (1.00, -1.00, PaA), (1.02, -0.50, PaA*1.05),
+        (0.98, -1.50, PaA*0.95), (1.05, -0.80, PaA)
+    ]
+    solA = solve_case_boundary(slicesA, PaA, MaA, phi_deg, c_base, kh, H,
+                               mode='slide2_reporting', starts=startsA)
+    print("\nUNIFORM (Slide2 reporting):")
+    for k,v in solA.items(): print(f"{k}: {v}")
+
+    # --- Case B: Inverted (Slide2 reporting) ---
+    alphaB = 38.1424
+    slicesB = build_slices_regimeB(n, H, h1, alphaB, beta_deg, gamma_soil, gamma_lcc, 1000)
+    pH = 207.9; k = pH/H
+    PaB = 0.5 * pH * H
+    MaB = (k * H**3)/3.0
+
+    # Good starts for Slide2 parity: FS≈1.01, lambda≈-0.8, E0≈(Slide2 left-side normal ~ 4147.61)
+    startsB = [
+        (1.01, -0.80, 4147.61), (1.02, -1.20, 4200.0),
+        (1.00, -0.50, 4100.0),  (1.04, -1.60, 4300.0)
+    ]
+    solB = solve_case_boundary(slicesB, PaB, MaB, phi_deg, c_base, kh, H,
+                               mode='slide2_reporting', starts=startsB)
+    print("\nINVERTED (Slide2 reporting):")
+    for k,v in solB.items(): print(f"{k}: {v}")
