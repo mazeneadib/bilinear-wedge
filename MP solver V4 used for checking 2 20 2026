@@ -473,7 +473,7 @@ if __name__ == "__main__":
     h2 = 35.0
 
     beta_deg = 33.69
-    alpha_deg = 32.65
+    alpha_deg = 38.8943
 
     gamma_soil = 120.0
     gamma_lcc  = 40.0
