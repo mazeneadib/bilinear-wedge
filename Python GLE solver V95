@@ -1,0 +1,481 @@
+# -*- coding: utf-8 -*-
+"""
+MP_GLE_MP_RunFix_v5.py
+Generated: 2026-02-20
+
+V5 UPDATE (per user requirement)
+--------------------------------
+- Reuse V4 geometry/slice construction and MP scaffolding.
+- DO NOT impose E0 = Pa.
+- Treat wall load as a prescribed traction boundary condition represented by:
+    Pa = ∫ p(y) dy   (horizontal resultant)
+    Ma = ∫ p(y) y dy (moment about toe/base origin)
+  If only (Pa, hps) are provided, Ma is taken as Ma = Pa*hps.
+- Introduce E0 as an UNKNOWN (left boundary interslice normal force resultant),
+  solved simultaneously with (FS, lambda).
+- Solve the 3 unknowns (FS, lambda, E0) from 3 equations simultaneously:
+    (1) En(FS,lambda,E0) = 0    (right boundary free)
+    (2) M(FS,lambda,E0)  = 0    (global moment about toe)
+    (3) ΣFx(FS,lambda,E0)= 0    (global horizontal force equilibrium)
+- No nested solve. Coupled damped Newton with finite-difference Jacobian.
+
+Notes on sign conventions:
+- Preserves the V4 convention where a positive Pa and positive hps contribute
+  a negative moment term: M += -Pa*hps.
+"""
+
+import math
+import numpy as np
+
+# -------------------------
+# Helpers
+# -------------------------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+def half_sine_f(n: int) -> np.ndarray:
+    idx = np.arange(n + 1, dtype=float)
+    return np.sin(np.pi * idx / n)  # f[0]=f[n]=0
+
+# -------------------------
+# Regime switch
+# -------------------------
+def alpha_critical_deg(h1: float, h2: float, beta_deg: float) -> float:
+    if h2 <= 0:
+        raise ValueError("h2 must be > 0")
+    beta = math.radians(beta_deg)
+    val = ((h1 + h2) * math.tan(beta)) / h2
+    return math.degrees(math.atan(val))
+
+def choose_regime(alpha_deg: float, h1: float, h2: float, beta_deg: float) -> str:
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    return "A" if alpha_deg > acrit else "B"
+
+# -------------------------
+# Geometry primitives
+# -------------------------
+def y_base_regimeB(x: float, alpha_rad: float) -> float:
+    return x * math.tan(alpha_rad)
+
+def y_base_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    return min(x * math.tan(alpha_rad), h1 + x * math.tan(beta_rad))
+
+def base_angle_regimeA(x: float, h1: float, alpha_rad: float, beta_rad: float) -> float:
+    ya = x * math.tan(alpha_rad)
+    yb = h1 + x * math.tan(beta_rad)
+    return alpha_rad if ya <= yb else beta_rad
+
+def x_end_backoff_last_slice(x_end_theory: float, n: int, last_scale: float = 0.9999) -> float:
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not (0.0 < last_scale < 1.0):
+        raise ValueError("last_scale must be in (0,1)")
+    dx = x_end_theory / n
+    return x_end_theory - (1.0 - last_scale) * dx
+
+# -------------------------
+# Slice integration (exact-ish in x)
+# -------------------------
+def _integrate_slice_materials(x0, x1, H, h1, beta, yb_func, x_samples):
+    """Integrate soil/LCC areas and first moments over [x0,x1]."""
+    xs = np.linspace(x0, x1, int(x_samples))
+    A_soil = A_lcc = 0.0
+    Mx_soil = My_soil = 0.0
+    Mx_lcc  = My_lcc  = 0.0
+    tb = math.tan(beta)
+
+    def t_soil(yb_, yi_):
+        return max(0.0, min(H, yi_) - yb_)
+
+    def t_lcc(yb_, yi_):
+        return max(0.0, H - max(yi_, yb_))
+
+    for j in range(len(xs) - 1):
+        xa = float(xs[j]); xb = float(xs[j+1])
+        xm = 0.5*(xa+xb)
+        dxx = xb - xa
+
+        yb_a, yb_b, yb_m = yb_func(xa), yb_func(xb), yb_func(xm)
+        yi_a, yi_b, yi_m = (h1 + xa*tb), (h1 + xb*tb), (h1 + xm*tb)
+
+        ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+        tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+        As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+        Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+        Mx_soil += xm * As
+        Mx_lcc  += xm * Al
+
+        ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+        yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+        My_soil += ys * As
+        My_lcc  += yl * Al
+
+        A_soil += As
+        A_lcc  += Al
+
+    return A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc
+
+# -------------------------
+# Slice builders
+# -------------------------
+def build_slices_regimeB_singleplane_exact(
+    n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc, x_samples_per_slice=120
+):
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    ta = math.tan(alpha)
+    if abs(ta) < 1e-12:
+        raise ValueError("alpha too small")
+    x_end = H / ta
+    dx = x_end / n
+    cos_a = math.cos(alpha)
+    if abs(cos_a) < 1e-12:
+        raise ValueError("cos(alpha) too small")
+    L_nom = dx / cos_a
+
+    def yb(x): return y_base_regimeB(x, alpha)
+
+    slices = []
+    for i in range(n):
+        x0 = i*dx
+        x1 = (i+1)*dx
+        x_mid = 0.5*(x0+x1)
+        yb_mid = yb(x_mid)
+        if yb_mid >= H:
+            continue
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(dx), L=float(L_nom), a=float(alpha),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(x_mid), yb_base=float(yb_mid),
+        ))
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime B).")
+    return slices, x_end
+
+def build_slices_regimeA_bilinear_exact(
+    n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+    x_samples_per_slice=120, last_slice_scale=0.9999
+):
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    tb = math.tan(beta)
+    if abs(tb) < 1e-12:
+        raise ValueError("beta too small")
+    x_end_theory = (H - h1) / tb
+    x_end_eff = x_end_backoff_last_slice(x_end_theory, n, last_scale=last_slice_scale)
+    dx_nom = x_end_theory / n
+
+    def yb(x): return y_base_regimeA(x, h1, alpha, beta)
+
+    slices = []
+    for i in range(n):
+        x0 = i*dx_nom
+        x1 = min((i+1)*dx_nom, x_end_eff)
+        if x1 <= x0 + 1e-12:
+            break
+
+        x_mid = 0.5*(x0+x1)
+        yb_mid = yb(x_mid)
+        if yb_mid >= H:
+            continue
+
+        a_local = base_angle_regimeA(x_mid, h1, alpha, beta)
+        cos_a = math.cos(a_local)
+        if abs(cos_a) < 1e-12:
+            raise ValueError("cos(base angle) too small (Regime A)")
+        L = (x1-x0) / cos_a
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(x1-x0), L=float(L), a=float(a_local),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(x_mid), yb_base=float(yb_mid),
+        ))
+
+    if len(slices) < 5:
+        raise RuntimeError("Too few slices created (Regime A).")
+    return slices, x_end_theory, x_end_eff
+
+def build_slices_auto(
+    n, H, h1, h2, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+    x_samples_per_slice=120, last_slice_scale_A=0.9999
+):
+    reg = choose_regime(alpha_deg, h1, h2, beta_deg)
+    if reg == "A":
+        slices, x_end_theory, x_end_eff = build_slices_regimeA_bilinear_exact(
+            n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+            x_samples_per_slice=x_samples_per_slice,
+            last_slice_scale=last_slice_scale_A
+        )
+        return reg, slices, dict(x_end_theory=x_end_theory, x_end_eff=x_end_eff)
+    slices, x_end = build_slices_regimeB_singleplane_exact(
+        n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc,
+        x_samples_per_slice=x_samples_per_slice
+    )
+    return reg, slices, dict(x_end=x_end)
+
+# -------------------------------------------------------------------
+# V5 MP march with traction wall loading and free E0 (unknown)
+# -------------------------------------------------------------------
+def mp_march_wall_traction(FS, lam, E0, slices, Pa, Ma, phi_deg, c_base, kh):
+    """
+    Wall pressure is handled as traction:
+      - Apply Pa as external horizontal load (here applied to slice 0)
+      - Apply Ma as external moment about toe
+    Left boundary interslice normal E0 is UNKNOWN (not imposed as Pa or 0).
+
+    Returns: (En, Mtot, Fx_residual)
+    """
+    phi = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+
+    n = len(slices)
+    f = half_sine_f(n)
+
+    E = np.zeros(n+1, dtype=float)
+    E[0] = float(E0)
+
+    # External wall traction moment about toe
+    # Preserve V4 sign convention: M += -Pa*hps, so here M += -Ma
+    Mtot = -float(Ma)
+
+    c_eff   = float(c_base) / float(FS)
+    tan_eff = float(tan_phi) / float(FS)
+
+    sum_Fx_in   = 0.0
+    sum_Fx_base = 0.0
+
+    for i, sl in enumerate(slices):
+        W = sl["W"]; a = sl["a"]; L = sl["L"]
+        xC = sl["x"]; yC = sl["y"]
+        xB = sl["x_base"]; yB = sl["yb_base"]
+
+        cos_a = math.cos(a); sin_a = math.sin(a)
+
+        # External horizontal input: pseudo-static + wall traction on slice 0
+        Fx_in = -kh * W
+        if i == 0:
+            Fx_in += Pa
+        sum_Fx_in += Fx_in
+
+        EiL = E[i]
+        XiL = lam * f[i] * EiL
+        fR  = f[i+1]
+
+        A = (tan_eff * cos_a - sin_a)
+        B = (tan_eff * sin_a + cos_a)
+
+        rhs_const = (XiL - W + c_eff*L*sin_a)
+        lhs_const = lam * fR * (EiL + Fx_in + c_eff*L*cos_a)
+
+        denom = (lam*fR*A - B)
+        if abs(denom) < 1e-14:
+            return None
+
+        N = (rhs_const - lhs_const) / denom
+
+        EiR = EiL + Fx_in + c_eff*L*cos_a + N*A
+        E[i+1] = EiR
+
+        S = c_eff*L + N*tan_eff
+        Fx_base = (-N*sin_a) + (S*cos_a)
+        Fy_base = ( N*cos_a) + (S*sin_a)
+
+        sum_Fx_base += Fx_base
+
+        # Moments about toe (same pattern as V4)
+        Mtot += (-yC*Fx_in)
+        Mtot += (xC*(-W))
+        Mtot += (xB*Fy_base - yB*Fx_base)
+
+    En = float(E[-1])
+
+    # Global horizontal equilibrium residual:
+    # Inter-slice boundary contribution to net Fx is (E0 - En) (with sign consistent to V4 E being "normal" on slice sides)
+    Fx_res = (float(E0) - En) + sum_Fx_in + sum_Fx_base
+
+    return float(En), float(Mtot), float(Fx_res)
+
+# -------------------------------------------------------------------
+# Coupled solve for (FS, lambda, E0): En=0, M=0, Fx=0 (simultaneous)
+# -------------------------------------------------------------------
+def solve_coupled_FS_lam_E0(
+    slices, Pa, Ma, phi_deg, c_base, kh,
+    x0=(1.1, 0.0, 0.0),
+    bounds=((0.2, 10.0), (-500.0, 500.0), (-50000.0, 50000.0)),
+    tol=(1e-7, 1e-4, 1e-4),
+    max_iter=80
+):
+    FS, lam, E0 = map(float, x0)
+
+    def eval_res(FS_, lam_, E0_):
+        out = mp_march_wall_traction(FS_, lam_, E0_, slices, Pa, Ma, phi_deg, c_base, kh)
+        if out is None:
+            return None
+        En, M, Fx = out
+        return np.array([En, M, Fx], dtype=float)
+
+    # Damped Newton with FD Jacobian
+    for it in range(1, max_iter+1):
+        FS = clamp(FS, *bounds[0])
+        lam = clamp(lam, *bounds[1])
+        E0  = clamp(E0,  *bounds[2])
+
+        r = eval_res(FS, lam, E0)
+        if r is None:
+            # Try a small nudge on lambda if denom singular
+            lam = clamp(lam + 1.0, *bounds[1])
+            r = eval_res(FS, lam, E0)
+            if r is None:
+                raise RuntimeError("mp_march failed repeatedly near current iterate.")
+
+        if abs(r[0]) < tol[0] and abs(r[1]) < tol[1] and abs(r[2]) < tol[2]:
+            return dict(FS=FS, lam=lam, E0=E0, En=float(r[0]), M=float(r[1]), Fx=float(r[2]), iters=it, note="")
+
+        # Finite difference steps
+        steps = np.array([
+            1e-4*max(1.0, abs(FS)),
+            1e-3*max(1.0, abs(lam)),
+            1e-3*max(1.0, abs(E0)),
+        ], dtype=float)
+
+        J = np.zeros((3,3), dtype=float)
+        x = np.array([FS, lam, E0], dtype=float)
+
+        for k in range(3):
+            d = float(steps[k])
+            xk = x.copy()
+            xk[k] = clamp(xk[k] + d, *bounds[k])
+            rk = eval_res(float(xk[0]), float(xk[1]), float(xk[2]))
+            if rk is None:
+                # enlarge step and retry once
+                d *= 10.0
+                xk = x.copy()
+                xk[k] = clamp(xk[k] + d, *bounds[k])
+                rk = eval_res(float(xk[0]), float(xk[1]), float(xk[2]))
+                if rk is None:
+                    raise RuntimeError("Jacobian eval failed (march singular).")
+            J[:,k] = (rk - r) / d
+
+        try:
+            dx = np.linalg.solve(J, -r)
+        except np.linalg.LinAlgError:
+            # fallback: tiny step
+            dx = np.array([0.0, 0.0, 0.0], dtype=float)
+
+        # Line search / damping
+        step = 1.0
+        merit0 = float(np.sum(np.abs(r)))
+        best = (merit0, FS, lam, E0, r)
+
+        for _ in range(14):
+            FS_t  = float(clamp(FS  + step*dx[0], *bounds[0]))
+            lam_t = float(clamp(lam + step*dx[1], *bounds[1]))
+            E0_t  = float(clamp(E0  + step*dx[2], *bounds[2]))
+            rt = eval_res(FS_t, lam_t, E0_t)
+            if rt is not None:
+                merit = float(np.sum(np.abs(rt)))
+                if merit < best[0]:
+                    best = (merit, FS_t, lam_t, E0_t, rt)
+                    break
+            step *= 0.5
+
+        _, FS, lam, E0, r = best
+
+    return dict(FS=FS, lam=lam, E0=E0, En=float(r[0]), M=float(r[1]), Fx=float(r[2]), iters=max_iter,
+                note="max_iter reached")
+
+# -------------------------
+# Example / provided parameter solve
+# -------------------------
+if __name__ == "__main__":
+    # Provided parameters (from your V4 __main__)
+    H = 38.0
+    h1 = 3.0
+    h2 = 35.0
+
+    beta_deg = 33.69
+    alpha_deg = 32.65
+
+    gamma_soil = 120.0
+    gamma_lcc  = 40.0
+
+    Pa  = 3950.0
+    hps = 19.0
+    Ma  = Pa * hps   # if you have explicit p(y), replace with Ma = ∫ p(y) y dy
+
+    phi_deg = 30.0
+    c_base  = 200.0
+    kh      = 0.16
+
+    n_slices = 50
+
+    reg, slices, geom = build_slices_auto(
+        n=n_slices, H=H, h1=h1, h2=h2,
+        alpha_deg=alpha_deg, beta_deg=beta_deg,
+        gamma_soil=gamma_soil, gamma_lcc=gamma_lcc,
+        x_samples_per_slice=120,
+        last_slice_scale_A=0.9999
+    )
+
+    acrit = alpha_critical_deg(h1, h2, beta_deg)
+    print(f"alpha_crit={acrit:.6f} deg | alpha={alpha_deg:.6f} deg -> Regime {reg}")
+    print(f"Geometry: {geom} | slices={len(slices)}")
+
+    # Coupled solve for (FS, lambda, E0) WITHOUT imposing E0=Pa
+    sol = solve_coupled_FS_lam_E0(
+        slices=slices,
+        Pa=Pa, Ma=Ma,
+        phi_deg=phi_deg,
+        c_base=c_base,
+        kh=kh,
+        x0=(1.1, 0.0, 0.0),
+        bounds=((0.2, 10.0), (-500.0, 500.0), (-50000.0, 50000.0)),
+        tol=(1e-7, 1e-4, 1e-4),
+        max_iter=80
+    )
+
+    print("\n--- MP solve V5 (coupled, traction wall load, free E0) ---")
+    print(f"FS   = {sol['FS']:.6f}")
+    print(f"lam  = {sol['lam']:+.6f}")
+    print(f"E0   = {sol['E0']:+.6f}   (NOT imposed as Pa)")
+    print(f"En   = {sol['En']:+.3e}   (target 0)")
+    print(f"M    = {sol['M']:+.3e}   (target 0)")
+    print(f"Fx   = {sol['Fx']:+.3e}   (target 0)")
+    print(f"iters={sol['iters']}")
+    if sol.get("note"):
+        print(sol["note"])
+
+    # If you want the implied traction centroid from Pa & Ma:
+    if abs(Pa) > 0:
+        print(f"\nWall traction centroid ybar = Ma/Pa = {Ma/Pa:.6f} ft")
