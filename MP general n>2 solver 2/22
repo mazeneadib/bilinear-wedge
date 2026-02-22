@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""
+mp_gle_solver_general_n.py
+
+General-n Morgenstern–Price / GLE-style solver for Mazen Adib's active-wedge diagnostics.
+
+Key features:
+- n slices (n >= 2)
+- Regime A bilinear base: y_base(x)=min(x*tan(alpha), h1 + x*tan(beta))
+- Optional "stop at kink" domain truncation
+- Optional "force kink boundary" so no slice straddles x_kink when not stopping at kink
+- Two-material weights (soil + LCC) and slice centroids from numerical integration
+- Unknowns: (FS, lambda, dP) where E0 = Pa + dP
+- Closures solved (choose one):
+    Fx: [En=0, SumFx=0, SumM_toe=0]
+    Fy: [En=0, SumFy=0, SumM_toe=0]
+
+Usage examples:
+  python mp_gle_solver_general_n.py --case triangular --n 2  --x_end 21.41808 --closure Fx --stop_at_kink True
+  python mp_gle_solver_general_n.py --case uniform    --n 12 --x_end 21.41808 --closure Fy --stop_at_kink True
+  python mp_gle_solver_general_n.py --case uniform    --n 50 --x_end 30.0     --closure Fx --stop_at_kink False --force_kink_boundary True
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+
+# -----------------------------
+# Geometry helpers (Regime A)
+# -----------------------------
+def y_int(x: float, h1: float, beta: float) -> float:
+    return h1 + x * math.tan(beta)
+
+
+def y_base_regimeA(x: float, h1: float, alpha: float, beta: float) -> float:
+    return min(x * math.tan(alpha), h1 + x * math.tan(beta))
+
+
+def base_angle_regimeA(x: float, h1: float, alpha: float, beta: float) -> float:
+    ya = x * math.tan(alpha)
+    yb = h1 + x * math.tan(beta)
+    return alpha if ya <= yb else beta
+
+
+def x_kink(h1: float, alpha: float, beta: float) -> float:
+    """Intersection of x*tan(alpha) and h1 + x*tan(beta)."""
+    return h1 / (math.tan(alpha) - math.tan(beta))
+
+
+@dataclass(frozen=True)
+class Slice:
+    i: int
+    x0: float
+    x1: float
+    dx: float
+    L: float
+    a: float
+    W: float
+    xC: float
+    yC: float
+    xB: float
+    yB: float
+
+
+# -----------------------------
+# Slice construction
+# -----------------------------
+def build_slices_equal_on_interval(
+    x_left: float,
+    x_right: float,
+    n_local: int,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float,
+    gamma_lcc: float,
+    ns: int = 4000,
+    i_offset: int = 0,
+) -> List[Slice]:
+    """Build n_local equal-width slices on [x_left, x_right]."""
+    if n_local < 1:
+        raise ValueError("n_local must be >= 1")
+
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(beta_deg)
+    dx_nom = (x_right - x_left) / n_local
+
+    def yb(x: float) -> float:
+        return y_base_regimeA(x, h1, alpha, beta)
+
+    def yi(x: float) -> float:
+        return y_int(x, h1, beta)
+
+    slices: List[Slice] = []
+
+    for j in range(n_local):
+        x0 = x_left + j * dx_nom
+        x1 = x_left + (j + 1) * dx_nom
+        xm = 0.5 * (x0 + x1)
+
+        a = base_angle_regimeA(xm, h1, alpha, beta)
+        L = (x1 - x0) / math.cos(a)
+
+        xs = np.linspace(x0, x1, ns)
+
+        A_s = 0.0
+        A_c = 0.0
+        Mx_s = 0.0
+        Mx_c = 0.0
+        My_s = 0.0
+        My_c = 0.0
+
+        for k in range(len(xs) - 1):
+            xa = float(xs[k])
+            xb = float(xs[k + 1])
+            xm2 = 0.5 * (xa + xb)
+            dxx = xb - xa
+
+            yb_a, yb_b, yb_m = yb(xa), yb(xb), yb(xm2)
+            yi_a, yi_b, yi_m = yi(xa), yi(xb), yi(xm2)
+
+            ts_a = max(0.0, min(H, yi_a) - yb_a)
+            ts_b = max(0.0, min(H, yi_b) - yb_b)
+            ts_m = max(0.0, min(H, yi_m) - yb_m)
+
+            tl_a = max(0.0, H - max(yi_a, yb_a))
+            tl_b = max(0.0, H - max(yi_b, yb_b))
+            tl_m = max(0.0, H - max(yi_m, yb_m))
+
+            As = (dxx / 6.0) * (ts_a + 4.0 * ts_m + ts_b)
+            Al = (dxx / 6.0) * (tl_a + 4.0 * tl_m + tl_b)
+
+            A_s += As
+            A_c += Al
+            Mx_s += xm2 * As
+            Mx_c += xm2 * Al
+
+            ys = (yb_m + 0.5 * ts_m) if ts_m > 0 else 0.0
+            yl = (H - 0.5 * tl_m) if tl_m > 0 else 0.0
+            My_s += ys * As
+            My_c += yl * Al
+
+        W = gamma_soil * A_s + gamma_lcc * A_c
+        xC = (gamma_soil * Mx_s + gamma_lcc * Mx_c) / W if W > 0 else 0.0
+        yC = (gamma_soil * My_s + gamma_lcc * My_c) / W if W > 0 else 0.0
+
+        slices.append(
+            Slice(
+                i=i_offset + j + 1,
+                x0=x0,
+                x1=x1,
+                dx=x1 - x0,
+                L=L,
+                a=a,
+                W=W,
+                xC=xC,
+                yC=yC,
+                xB=xm,
+                yB=yb(xm),
+            )
+        )
+
+    return slices
+
+
+def build_slices_with_kink_control(
+    n: int,
+    x_end: float,
+    stop_at_kink: bool,
+    force_kink_boundary: bool,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float,
+    gamma_lcc: float,
+    ns: int = 4000,
+) -> Tuple[List[Slice], float]:
+    """
+    Build slices either up to x_end, or truncated at kink.
+    Optionally force a boundary at kink when not truncating.
+    Returns: (slices, x_stop)
+    """
+    if n < 2:
+        raise ValueError("n must be >= 2")
+
+    alpha = math.radians(alpha_deg)
+    beta = math.radians(beta_deg)
+    xk = x_kink(h1, alpha, beta)
+
+    # Determine analysis end
+    x_stop = min(x_end, xk) if stop_at_kink else x_end
+
+    if (not stop_at_kink) and force_kink_boundary and (0.0 < xk < x_end):
+        # allocate slices left/right proportional to lengths, ensure at least 1 slice each side
+        n_left = int(round(n * (xk / x_end)))
+        n_left = max(1, min(n - 1, n_left))
+        n_right = n - n_left
+
+        left = build_slices_equal_on_interval(
+            0.0, xk, n_left, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc, ns=ns, i_offset=0
+        )
+        right = build_slices_equal_on_interval(
+            xk, x_end, n_right, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc, ns=ns, i_offset=n_left
+        )
+        return left + right, x_stop
+
+    # simple equal slices on [0, x_stop]
+    slices = build_slices_equal_on_interval(
+        0.0, x_stop, n, H, h1, alpha_deg, beta_deg, gamma_soil, gamma_lcc, ns=ns, i_offset=0
+    )
+    return slices, x_stop
+
+
+# -----------------------------
+# Interslice function (Half-Sine)
+# -----------------------------
+def f_half_sine_interfaces_from_slices(slices: List[Slice]) -> np.ndarray:
+    """Half-sine on normalized x based on the slice interface x positions."""
+    xs = [slices[0].x0] + [sl.x1 for sl in slices]
+    xs = np.array(xs, float)
+    xi = (xs - xs[0]) / (xs[-1] - xs[0])
+    return np.sin(np.pi * xi)
+
+
+# -----------------------------
+# Marcher and solver
+# -----------------------------
+def mp_march(
+    FS: float,
+    lam: float,
+    dP: float,
+    Pa: float,
+    hps: float,
+    slices: List[Slice],
+    f_arr: np.ndarray,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+) -> Optional[Dict[str, float]]:
+    """March left->right and return En, SumFx, SumFy, SumM_toe and E0."""
+    n = len(slices)
+
+    phi = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+
+    E = np.zeros(n + 1)
+    E[0] = Pa + dP
+
+    M = -Pa * hps
+
+    c_eff = c_base / FS
+    tan_eff = tan_phi / FS
+
+    sumFx_in = 0.0
+    sumFx_base = 0.0
+    sumFy_base = 0.0
+    sumW = 0.0
+
+    for sl in slices:
+        ca, sa = math.cos(sl.a), math.sin(sl.a)
+        L = sl.L
+        W = sl.W
+        sumW += W
+
+        Fx_in = -kh * W
+        sumFx_in += Fx_in
+
+        i = sl.i
+        EiL = E[i - 1]
+
+        kL = lam * f_arr[i - 1]
+        kR = lam * f_arr[i]
+        XiL = kL * EiL
+
+        A = (tan_eff * ca - sa)
+        B = (tan_eff * sa + ca)
+
+        rhs = (XiL - W + c_eff * L * sa)
+        lhs = kR * (EiL + Fx_in + c_eff * L * ca)
+
+        denom = (kR * A - B)
+        if abs(denom) < 1e-14:
+            return None
+
+        N = (rhs - lhs) / denom
+        EiR = EiL + Fx_in + c_eff * L * ca + N * A
+        E[i] = EiR
+
+        S = c_eff * L + N * tan_eff
+
+        Fx_base = (-N * sa) + (S * ca)
+        Fy_base = (N * ca) + (S * sa)
+        sumFx_base += Fx_base
+        sumFy_base += Fy_base
+
+        M += (-sl.yC) * Fx_in + sl.xC * (-W) + (sl.xB * Fy_base - sl.yB * Fx_base)
+
+    En = float(E[-1])
+    sumFx = (E[0] - E[-1]) + sumFx_in + sumFx_base
+    sumFy = sumFy_base - sumW
+
+    return {
+        "En": En,
+        "SumFx": sumFx,
+        "SumFy": sumFy,
+        "SumM_toe": M,
+        "E0_eff": float(E[0]),
+    }
+
+
+def solve_3eq(
+    closure: str,
+    seeds: List[Tuple[float, float, float]],
+    Pa: float,
+    hps: float,
+    slices: List[Slice],
+    f_arr: np.ndarray,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    tol: float = 1e-10,
+    max_iter: int = 160,
+) -> Dict[str, float]:
+    """Solve for (FS, lambda, dP) using [En=0, SumF*=0, SumM_toe=0]."""
+    closure_l = closure.lower().strip()
+    if closure_l not in ("fx", "fy"):
+        raise ValueError("closure must be 'Fx' or 'Fy'")
+
+    def residual(x: np.ndarray) -> Optional[Tuple[np.ndarray, Dict[str, float]]]:
+        FS, lam, dP = float(x[0]), float(x[1]), float(x[2])
+        out = mp_march(FS, lam, dP, Pa, hps, slices, f_arr, phi_deg, c_base, kh)
+        if out is None:
+            return None
+        r2 = out["SumFx"] if closure_l == "fx" else out["SumFy"]
+        r = np.array([out["En"], r2, out["SumM_toe"]], float)
+        return r, out
+
+    def newton_lm(x0: Tuple[float, float, float]) -> Optional[Dict[str, float]]:
+        x = np.array(x0, float)
+        mu = 1e-2
+
+        ro = residual(x)
+        if ro is None:
+            return None
+
+        for _ in range(max_iter):
+            r, out = ro
+
+            if np.linalg.norm(r, ord=np.inf) < tol:
+                out2 = dict(out)
+                out2["FS"] = float(x[0])
+                out2["lambda"] = float(x[1])
+                out2["dP"] = float(x[2])
+                out2["closure"] = closure_l
+                out2["res_inf"] = float(np.linalg.norm(r, ord=np.inf))
+                return out2
+
+            # finite-difference Jacobian
+            J = np.zeros((3, 3), float)
+            h = np.array(
+                [
+                    1e-6 * max(1.0, abs(x[0])),
+                    1e-6 * max(1.0, abs(x[1])),
+                    1e-6 * max(1000.0, abs(Pa), abs(x[2]) + 100.0),
+                ]
+            )
+            r0 = r.copy()
+
+            for k in range(3):
+                xp = x.copy()
+                xp[k] += h[k]
+                rp = residual(xp)
+                if rp is None:
+                    return None
+                rpp, _ = rp
+                J[:, k] = (rpp - r0) / h[k]
+
+            A = J.T @ J + mu * np.eye(3)
+            g = J.T @ r0
+
+            try:
+                dx = -np.linalg.solve(A, g)
+            except np.linalg.LinAlgError:
+                mu *= 4.0
+                continue
+
+            base = float(np.sum(np.abs(r0)))
+            step = 1.0
+            improved = False
+
+            for _ls in range(14):
+                xt = x + step * dx
+                xt[0] = max(0.05, xt[0])  # FS > 0
+
+                rt = residual(xt)
+                if rt is not None:
+                    rv, _ = rt
+                    if float(np.sum(np.abs(rv))) < base * (1 - 1e-4):
+                        x = xt
+                        ro = rt
+                        mu = max(1e-7, mu / 3.0)
+                        improved = True
+                        break
+
+                step *= 0.5
+
+            if not improved:
+                mu = min(1e4, mu * 4.0)
+
+        return None
+
+    sols: List[Dict[str, float]] = []
+    for s in seeds:
+        sol = newton_lm(s)
+        if sol is not None:
+            sols.append(sol)
+
+    if not sols:
+        raise RuntimeError("No solution found for the provided seeds.")
+
+    return min(sols, key=lambda d: abs(d["res_inf"]))
+
+
+# -----------------------------
+# Main / CLI
+# -----------------------------
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--case", choices=["uniform", "triangular"], required=True)
+    ap.add_argument("--closure", choices=["Fx", "Fy"], required=True)
+    ap.add_argument("--n", type=int, default=12)
+    ap.add_argument("--x_end", type=float, default=21.41808)
+    ap.add_argument("--stop_at_kink", type=lambda s: s.lower() == "true", default=True)
+    ap.add_argument("--force_kink_boundary", type=lambda s: s.lower() == "true", default=True)
+    ap.add_argument("--ns", type=int, default=4000)
+    args = ap.parse_args()
+
+    # Fixed model parameters (edit if needed)
+    H = 38.0
+    h1 = 3.0
+    alpha_deg = 38.8943
+    beta_deg = 33.69
+    gamma_soil = 120.0
+    gamma_lcc = 40.0
+    phi_deg = 30.0
+    c_base = 200.0
+    kh = 0.16
+
+    # Loads + seeds
+    if args.case == "uniform":
+        Pa = 3948.2
+        hps = 19.0
+        seeds = [
+            (1.0, 0.8, -1e-3),
+            (1.0, 0.6, 0.0),
+            (1.0, 0.8, 0.0),
+            (1.0, 0.6, 200.0),
+            (0.9, 0.6, -200.0),
+        ]
+    else:
+        pmax = 207.8947
+        Pa = 0.5 * pmax * H
+        hps = (2.0 / 3.0) * H
+        seeds = [(1.0, -0.6, 200.0), (1.0, -0.3, 0.0), (1.1, -0.5, 200.0), (0.9, -0.8, -200.0)]
+
+    # Build slices with kink handling
+    slices, x_stop = build_slices_with_kink_control(
+        n=args.n,
+        x_end=args.x_end,
+        stop_at_kink=args.stop_at_kink,
+        force_kink_boundary=args.force_kink_boundary,
+        H=H,
+        h1=h1,
+        alpha_deg=alpha_deg,
+        beta_deg=beta_deg,
+        gamma_soil=gamma_soil,
+        gamma_lcc=gamma_lcc,
+        ns=args.ns,
+    )
+
+    # Build interslice function on interfaces
+    f_arr = f_half_sine_interfaces_from_slices(slices)
+
+    # Solve
+    sol = solve_3eq(
+        closure=args.closure,
+        seeds=seeds,
+        Pa=Pa,
+        hps=hps,
+        slices=slices,
+        f_arr=f_arr,
+        phi_deg=phi_deg,
+        c_base=c_base,
+        kh=kh,
+    )
+
+    print("\n=== Run summary ===")
+    print(f"case={args.case}, closure={args.closure}, n={args.n}")
+    print(f"x_end={args.x_end:.6f}, stop_at_kink={args.stop_at_kink}, force_kink_boundary={args.force_kink_boundary}")
+
+    xk = x_kink(h1, math.radians(alpha_deg), math.radians(beta_deg))
+    print(f"x_kink={xk:.6f}, x_stop={x_stop:.6f}")
+    print(f"Pa={Pa:.6f} lb/ft, hps={hps:.6f} ft")
+
+    print("\n=== Solution ===")
+    print(f"FS = {sol['FS']:.12f}")
+    print(f"lambda = {sol['lambda']:.12f}")
+    print(f"dP = {sol['dP']:.12f} lb/ft")
+    print(f"E0_eff = {sol['E0_eff']:.12f} lb/ft")
+
+    print("\n=== Residual check ===")
+    print(f"En = {sol['En']:.3e}")
+    print(f"SumFx = {sol['SumFx']:.3e}")
+    print(f"SumFy = {sol['SumFy']:.3e}")
+    print(f"M_toe = {sol['SumM_toe']:.3e}")
+    print(f"res_inf = {sol['res_inf']:.3e}")
+
+    print("\nSlice summary:")
+    for sl in slices[: min(6, len(slices))]:
+        print(
+            f" i={sl.i:3d} x0={sl.x0:9.4f} x1={sl.x1:9.4f} "
+            f"L={sl.L:9.4f} W={sl.W:10.2f} a={math.degrees(sl.a):7.3f}"
+        )
+    if len(slices) > 6:
+        print(f" ... ({len(slices) - 6} more slices) ...")
+
+
+if __name__ == "__main__":
+    main()
