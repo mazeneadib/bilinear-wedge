@@ -1,0 +1,757 @@
+# -*- coding: utf-8 -*-
+"""
+Auto-regime MP/GLE (Half-sine) with strict solver, central/forward Jacobian,
+MultiStart with seed, and tight-regime controls.
+
+Key capabilities:
+- Auto branch to Regime A or B from alpha_failure vs alpha_critical.
+- Tight bounds: FS, lambda (>0), dP (±dp_pct * Pa).
+- Strict Newton solver with line search, trust cap, central or forward FD Jacobian.
+- Optional residual scaling (En/|Pa|, M/|Ma|, Fx/|Pa|) to mirror Excel's "Automatic Scaling".
+- MultiStart(pop, seed) + optional deterministic anchors for robust coverage.
+- Practical h_ps sweep (0.1 ft) with "best near FS≈1" selection (tie → smaller |dP|).
+"""
+
+import math
+import numpy as np
+from typing import List, Dict, Optional, Tuple
+
+# -----------------------
+# Constants
+# -----------------------
+LAMBDA_MIN = 1e-12  # strictly positive lower bound for lambda (active state)
+EPS_BOUNDS  = 1e-12
+
+# -----------------------
+# Utilities
+# -----------------------
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+def half_sine_f(n: int) -> np.ndarray:
+    idx = np.arange(n + 1, dtype=float)
+    return np.sin(np.pi * idx / n)  # f[0]=f[n]=0
+
+# -----------------------
+# Geometry helpers
+# -----------------------
+def alpha_critical_deg(H: float, h1: float, beta_deg: float) -> float:
+    """
+    alpha_critical = atan( (H * tan(beta)) / (H - h1) ) [deg]
+    (reduces to beta if h1=0).
+    """
+    beta = math.radians(beta_deg)
+    denom = H - h1
+    if abs(denom) < EPS_BOUNDS:
+        denom = math.copysign(EPS_BOUNDS, denom if denom != 0 else 1.0)
+    val = (H * math.tan(beta)) / denom
+    return math.degrees(math.atan(val))
+
+def h_soil_from_alpha(alpha_deg: float, h1: float, beta_deg: float) -> float:
+    """
+    Invert alpha = atan( (h_soil * tan(beta)) / (h_soil - h1) ):
+        let t = tan(alpha), tb = tan(beta).
+        h_soil = (t * h1) / (t - tb)
+    """
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+    t  = math.tan(alpha)
+    tb = math.tan(beta)
+    denom = t - tb
+    if abs(denom) < EPS_BOUNDS:
+        denom = math.copysign(EPS_BOUNDS, denom if denom != 0 else 1.0)
+    return (t * h1) / denom
+
+# -----------------------
+# Cross-section integration
+# -----------------------
+def _integrate_slice_materials(
+    x0: float,
+    x1: float,
+    H: float,
+    h1: float,
+    beta: float,
+    yb_func,
+    x_samples: int
+) -> Tuple[float, float, float, float, float, float]:
+    """
+    Integrate soil and LCC areas and first moments over one slice [x0, x1].
+    Ground at y = H; interface y_i(x) = h1 + x*tan(beta); base y_b(x) = yb_func(x).
+    Returns: (A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc)
+    """
+    xs = np.linspace(x0, x1, int(x_samples))
+    tb = math.tan(beta)
+
+    A_soil = A_lcc = 0.0
+    Mx_soil = My_soil = 0.0
+    Mx_lcc = My_lcc = 0.0
+
+    def t_soil(yb_, yi_):
+        return max(0.0, min(H, yi_) - yb_)
+
+    def t_lcc(yb_, yi_):
+        return max(0.0, H - max(yi_, yb_))
+
+    for j in range(len(xs) - 1):
+        xa = float(xs[j]); xb = float(xs[j+1])
+        xm = 0.5*(xa+xb); dxx = xb - xa
+
+        yb_a, yb_b, yb_m = yb_func(xa), yb_func(xb), yb_func(xm)
+        yi_a, yi_b, yi_m = (h1 + xa*tb), (h1 + xb*tb), (h1 + xm*tb)
+
+        ts_a, ts_b, ts_m = t_soil(yb_a, yi_a), t_soil(yb_b, yi_b), t_soil(yb_m, yi_m)
+        tl_a, tl_b, tl_m = t_lcc (yb_a, yi_a), t_lcc (yb_b, yi_b), t_lcc (yb_m, yi_m)
+
+        As = (dxx/6.0)*(ts_a + 4.0*ts_m + ts_b)
+        Al = (dxx/6.0)*(tl_a + 4.0*tl_m + tl_b)
+
+        Mx_soil += xm * As
+        Mx_lcc  += xm * Al
+
+        ys = (yb_m + 0.5*ts_m) if ts_m > 0 else 0.0
+        yl = (H - 0.5*tl_m)    if tl_m > 0 else 0.0
+
+        My_soil += ys * As
+        My_lcc  += yl * Al
+
+        A_soil += As
+        A_lcc  += Al
+
+    return A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc
+
+# -----------------------
+# Slice builders (Regime B and A)
+# -----------------------
+def build_slices_regimeB(
+    n: int,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    gamma_soil: float = 120.0,
+    gamma_lcc: float  = 40.0,
+    x_samples_per_slice: int = 360
+) -> List[Dict[str, float]]:
+    """
+    Regime B: y_b(x) = x * tan(alpha), x_end = H / tan(alpha); y_i(x) = h1 + x*tan(beta).
+    """
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+
+    ta = math.tan(alpha)
+    if ta <= 0:
+        raise ValueError("alpha must be > 0 for Regime B")
+
+    x_end = H / ta
+    dx = x_end / n
+    cos_a = math.cos(alpha)
+    L_nom = dx / cos_a
+
+    def yb(x): return x * ta
+
+    slices: List[Dict[str, float]] = []
+    for i in range(n):
+        x0 = i*dx
+        x1 = (i+1)*dx
+        xm = 0.5*(x0 + x1)
+        yb_mid = yb(xm)
+        if yb_mid >= H:
+            continue
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(dx), L=float(L_nom), a=float(alpha),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(xm), yb_base=float(yb_mid)
+        ))
+
+    if len(slices) != n:
+        raise RuntimeError("Unexpected number of slices built (Regime B).")
+
+    return slices
+
+def build_slices_regimeA(
+    n: int,
+    H: float,
+    h1: float,
+    alpha_deg: float,
+    beta_deg: float,
+    h_soil: float,
+    gamma_soil: float = 120.0,
+    gamma_lcc: float  = 40.0,
+    x_samples_per_slice: int = 360
+) -> Tuple[List[Dict[str, float]], float]:
+    """
+    Regime A: y_b(x) = x * tan(alpha), x_end = L2 = h_soil / tan(alpha).
+    """
+    alpha = math.radians(alpha_deg)
+    beta  = math.radians(beta_deg)
+
+    ta = math.tan(alpha)
+    if ta <= 0:
+        raise ValueError("alpha must be > 0 for Regime A")
+
+    x_end = h_soil / ta  # L2
+    dx = x_end / n
+    cos_a = math.cos(alpha)
+    L_nom = dx / cos_a
+
+    def yb(x): return x * ta
+
+    slices: List[Dict[str, float]] = []
+    for i in range(n):
+        x0 = i*dx
+        x1 = (i+1)*dx
+        xm = 0.5*(x0 + x1)
+        yb_mid = yb(xm)
+        if yb_mid >= H:
+            continue
+
+        A_soil, A_lcc, Mx_soil, My_soil, Mx_lcc, My_lcc = _integrate_slice_materials(
+            x0, x1, H, h1, beta, yb, x_samples_per_slice
+        )
+        if (A_soil + A_lcc) <= 0:
+            continue
+
+        W = gamma_soil*A_soil + gamma_lcc*A_lcc
+        if W <= 0:
+            continue
+
+        x_c = (gamma_soil*Mx_soil + gamma_lcc*Mx_lcc) / W
+        y_c = (gamma_soil*My_soil + gamma_lcc*My_lcc) / W
+
+        slices.append(dict(
+            dx=float(dx), L=float(L_nom), a=float(alpha),
+            W=float(W), x=float(x_c), y=float(y_c),
+            x_base=float(xm), yb_base=float(yb_mid)
+        ))
+
+    if len(slices) != n:
+        raise RuntimeError("Unexpected number of slices built (Regime A).")
+
+    return slices, float(x_end)
+
+# -----------------------
+# March function (MP/GLE)
+# -----------------------
+def mp_march_wall_traction(
+    FS: float,
+    lam: float,
+    E0: float,
+    slices: List[Dict[str, float]],
+    Pa: float,
+    Ma: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float
+) -> Optional[np.ndarray]:
+    """
+    Residuals r = [En, Mtot, Fx_res].
+    - Per slice i: inertia Fx_in = -kh*W; add Pa only to slice 0.
+    - Start Mtot at -Ma (toe convention).
+    """
+    phi = math.radians(phi_deg)
+    tan_phi = math.tan(phi)
+
+    n = len(slices)
+    f = half_sine_f(n)
+
+    E = np.zeros(n + 1, dtype=float)
+    E[0] = float(E0)
+
+    Mtot = -float(Ma)
+
+    c_eff   = float(c_base) / float(FS) if FS != 0 else 1e30
+    tan_eff = float(tan_phi) / float(FS) if FS != 0 else 1e30
+
+    sum_Fx_in   = 0.0
+    sum_Fx_base = 0.0
+
+    for i, sl in enumerate(slices):
+        W  = sl["W"]; a  = sl["a"]; L  = sl["L"]
+        xC = sl["x"]; yC = sl["y"]
+        xB = sl["x_base"]; yB = sl["yb_base"]
+
+        cos_a = math.cos(a); sin_a = math.sin(a)
+
+        # External horizontal input: inertia + wall resultant on slice 0
+        Fx_in = -kh * W
+        if i == 0:
+            Fx_in += Pa
+        sum_Fx_in += Fx_in
+
+        EiL = E[i]
+        XiL = lam * f[i] * EiL
+        fR  = f[i+1]
+
+        A = (tan_eff * cos_a - sin_a)
+        B = (tan_eff * sin_a + cos_a)
+
+        rhs_const = (XiL - W + c_eff*L*sin_a)
+        lhs_const = lam * fR * (EiL + Fx_in + c_eff*L*cos_a)
+
+        denom = (lam * fR * A - B)
+        if abs(denom) < 1e-14:
+            return None
+
+        N   = (rhs_const - lhs_const) / denom
+        EiR = EiL + Fx_in + c_eff*L*cos_a + N*A
+        E[i+1] = EiR
+
+        S       = c_eff*L + N*tan_eff
+        Fx_base = (-N*sin_a) + (S*cos_a)
+        Fy_base = ( N*cos_a) + (S*sin_a)
+
+        sum_Fx_base += Fx_base
+
+        # Moments about toe: inertia + weights + base reactions; wall via -Ma
+        Mtot += (-yC * (-kh * W))
+        Mtot += (xC * (-W))
+        Mtot += (xB*Fy_base - yB*Fx_base)
+
+    En = float(E[-1])
+
+    # Global horizontal equilibrium residual
+    Fx_res = (float(E[0]) - En) + sum_Fx_in + sum_Fx_base
+
+    return np.array([En, Mtot, Fx_res], dtype=float)
+
+# -----------------------
+# Strict Newton solver with line search
+# -----------------------
+def solve_coupled_strict(
+    slices: List[Dict[str, float]],
+    Pa: float,
+    Ma: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    fs_bounds=(0.95, 1.05),
+    lam_bounds=(LAMBDA_MIN, 0.8),
+    dp_pct: float = 0.05,        # ±dp_pct * |Pa|
+    x0=(1.0, 0.10, 0.0, 0.0),
+    # Solver behavior:
+    fd_scheme: str = "central",  # 'central' or 'forward'
+    fd_scales=(1e-6, 1e-5, 1e-5, 1e-4),
+    line_search_max: int = 30,
+    required_merit_drop: float = 0.05,
+    max_rel_step: float = 0.10,
+    consecutive_needed: int = 2,
+    # Tolerances:
+    tol_abs=(1e-12, 1e-9, 1e-12),
+    tol_rel=(1e-8,  1e-8, 1e-8),
+    xtol_rel: float = 1e-8,
+    # Residual scaling:
+    scale_residuals: bool = False,
+) -> Dict[str, float]:
+    """
+    Solve for [FS, lambda, E0, dP_s], with dP = 1000*dP_s, applying tight bounds.
+    Returns dict with solution and residuals.
+    """
+    # Bounds
+    b_FS  = fs_bounds
+    b_lam = lam_bounds
+    b_E0  = (-5e5, 5e5)
+
+    ybar = Ma/Pa if Pa != 0 else 0.0
+    dP_abs_max   = dp_pct * abs(Pa)
+    dP_s_abs_max = dP_abs_max / 1000.0
+    b_dP = (-dP_s_abs_max, dP_s_abs_max)
+
+    FS, lam, E0 = float(x0[0]), float(x0[1]), float(x0[2])
+    dP_s        = float(x0[3]) if len(x0) > 3 and x0[3] is not None else 0.0
+
+    def eval_res(FS_, lam_, E0_, dP_s_):
+        dP    = 1000.0 * dP_s_
+        Pa_eff = Pa + dP
+        Ma_eff = Ma + ybar * dP
+        r = mp_march_wall_traction(FS_, lam_, E0_, slices, Pa_eff, Ma_eff, phi_deg, c_base, kh)
+        if r is None:
+            return None
+        if scale_residuals:
+            scales = np.array([max(abs(Pa), 1.0), max(abs(Ma), 1.0), max(abs(Pa), 1.0)], dtype=float)
+            r = r / scales
+        return r
+
+    def merit_L1(r: np.ndarray) -> float:
+        return float(np.sum(np.abs(r)))
+
+    # Seed residuals
+    r = eval_res(FS, lam, E0, dP_s)
+    if r is None:
+        lam = clamp(lam + 1e-6, *b_lam)
+        r = eval_res(FS, lam, E0, dP_s)
+        if r is None:
+            raise RuntimeError("march singular at start")
+
+    r0 = r.copy()
+    consec = 0
+
+    for it in range(1, 200 + 1):  # max_iter = 200
+        # Clamp to bounds
+        FS  = clamp(FS,  *b_FS)
+        lam = clamp(lam, *b_lam)
+        E0  = clamp(E0,  *b_E0)
+        dP_s = clamp(dP_s, *b_dP)
+
+        # Jacobian build (central or forward)
+        s_FS, s_lam, s_E0, s_dP = fd_scales
+        steps = [
+            s_FS  * max(1.0, abs(FS)),
+            s_lam * max(1.0, abs(lam)),
+            s_E0  * max(1.0, abs(E0)),
+            s_dP  * max(1.0, abs(dP_s)),
+        ]
+        J = np.zeros((3, 4), dtype=float)
+        x = [FS, lam, E0, dP_s]
+
+        for k in range(4):
+            h = float(steps[k])
+
+            if fd_scheme == "central":
+                # Central difference; if near bounds, fall back to one-sided
+                xk_plus  = list(x); xk_minus = list(x)
+                lo, hi = (b_FS if k==0 else b_lam if k==1 else b_E0 if k==2 else b_dP)
+                xk_plus[k]  = clamp(xk_plus[k] + h,  lo, hi)
+                xk_minus[k] = clamp(xk_minus[k] - h, lo, hi)
+
+                rp = eval_res(*xk_plus)
+                rm = eval_res(*xk_minus)
+
+                tries = 0
+                while (rp is None or rm is None) and tries < 2:
+                    h *= 10.0
+                    xk_plus  = list(x); xk_minus = list(x)
+                    xk_plus[k]  = clamp(xk_plus[k] + h,  lo, hi)
+                    xk_minus[k] = clamp(xk_minus[k] - h, lo, hi)
+                    rp = eval_res(*xk_plus)
+                    rm = eval_res(*xk_minus)
+                    tries += 1
+
+                if rp is not None and rm is not None and (xk_plus[k] != xk_minus[k]):
+                    J[:, k] = (rp - rm) / (2.0 * h)
+                else:
+                    # Fallback: forward difference
+                    xkf = list(x); xkf[k] = clamp(xkf[k] + h, lo, hi)
+                    rf  = eval_res(*xkf)
+                    tries = 0
+                    while rf is None and tries < 2:
+                        h *= 10.0
+                        xkf = list(x); xkf[k] = clamp(xkf[k] + h, lo, hi)
+                        rf  = eval_res(*xkf)
+                        tries += 1
+                    if rf is None:
+                        raise RuntimeError("Jacobian eval failed (central->forward).")
+                    J[:, k] = (rf - r) / h
+
+            else:
+                # Forward difference
+                lo, hi = (b_FS if k==0 else b_lam if k==1 else b_E0 if k==2 else b_dP)
+                xkf = list(x); xkf[k] = clamp(xkf[k] + h, lo, hi)
+                rf  = eval_res(*xkf)
+                tries = 0
+                while rf is None and tries < 2:
+                    h *= 10.0
+                    xkf = list(x); xkf[k] = clamp(xkf[k] + h, lo, hi)
+                    rf  = eval_res(*xkf)
+                    tries += 1
+                if rf is None:
+                    raise RuntimeError("Jacobian eval failed (forward).")
+                J[:, k] = (rf - r) / h
+
+        # Newton step
+        try:
+            dx = np.linalg.solve(J, -r)
+        except np.linalg.LinAlgError:
+            dx = np.linalg.lstsq(J, -r, rcond=None)[0]
+
+        # Trust-region cap (per-variable rel step)
+        x_vec = np.array([FS, lam, E0, dP_s], dtype=float)
+        den   = np.maximum(np.abs(x_vec), 1.0)
+        scale = np.maximum(1.0, np.max(np.abs(dx) / (max_rel_step * den)))
+        dx   /= scale
+
+        # Backtracking line search
+        merit0 = merit_L1(r)
+        best = None
+        step = 1.0
+        for _ in range(line_search_max):
+            cand = x_vec + step * dx
+            FS_t  = float(clamp(cand[0], *b_FS))
+            lam_t = float(clamp(cand[1], *b_lam))
+            E0_t  = float(clamp(cand[2], *b_E0))
+            dP_s_t = float(clamp(cand[3], *b_dP))
+            rt = eval_res(FS_t, lam_t, E0_t, dP_s_t)
+            if rt is not None:
+                m = merit_L1(rt)
+                if m < (merit0 * (1.0 - required_merit_drop)):
+                    best = (m, FS_t, lam_t, E0_t, dP_s_t, rt)
+                    break
+            step *= 0.5
+        if best is None:
+            # Accept current (conservative fallback)
+            best = (merit0, FS, lam, E0, dP_s, r)
+
+        _, FS, lam, E0, dP_s, r = best
+
+        # Convergence checks (abs + rel + x-step tolerance)
+        done_abs = (abs(r[0]) < tol_abs[0] and abs(r[1]) < tol_abs[1] and abs(r[2]) < tol_abs[2])
+        rel0     = np.maximum(np.abs(r0), 1.0)
+        done_rel = ((abs(r[0]) / rel0[0]) < tol_rel[0] and
+                    (abs(r[1]) / rel0[1]) < tol_rel[1] and
+                    (abs(r[2]) / rel0[2]) < tol_rel[2])
+
+        x_new = np.array([FS, lam, E0, dP_s], dtype=float)
+        rel_change = np.max(np.abs(x_new - x_vec) / np.maximum(1.0, np.abs(x_vec)))
+
+        if done_abs and done_rel and rel_change < xtol_rel:
+            consec += 1
+        else:
+            consec = 0
+
+        if consec >= consecutive_needed:
+            return dict(FS=FS, lam=lam, E0=E0,
+                        dP=1000.0*dP_s, dP_s=dP_s,
+                        En=float(r[0]), M=float(r[1]), Fx=float(r[2]), iters=it)
+
+    raise RuntimeError("max_iter reached without convergence (strict solver)")
+
+# -----------------------
+# Auto-branch + MultiStart (with optional anchors)
+# -----------------------
+def run_auto_regime_strict(
+    Pa: float,
+    h_ps: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    H: float,
+    h1: float,
+    beta_deg: float,
+    n_slices: int,
+    alpha_failure_deg: float,
+    # Tight regime controls:
+    fs_bounds=(0.95, 1.05),
+    lam_bounds=(LAMBDA_MIN, 0.8),
+    dp_pct: float = 0.05,
+    # Solver behavior:
+    fd_scheme: str = "central",
+    scale_residuals: bool = False,
+    tol_abs=(1e-12, 1e-9, 1e-12),
+    tol_rel=(1e-8,  1e-8, 1e-8),
+    xtol_rel: float = 1e-8,
+    # MultiStart:
+    pop: int = 10,
+    seed: int = 3,
+    use_anchor_starts: bool = False,
+) -> Tuple[str, float, Optional[float], Optional[Dict[str, float]], Optional[Dict[str, float]], int]:
+    """
+    Returns: (regime, alpha_critical_deg, L2_if_A_else_None, minFS_solution, minAbsDP_solution, num_valid_solutions)
+    """
+    acrit_deg = alpha_critical_deg(H, h1, beta_deg)
+
+    if alpha_failure_deg < acrit_deg:
+        regime = "B"
+        slices = build_slices_regimeB(n_slices, H, h1, alpha_failure_deg, beta_deg,
+                                      gamma_soil=120.0, gamma_lcc=40.0, x_samples_per_slice=360)
+        L2 = None
+    else:
+        regime = "A"
+        h_s = h_soil_from_alpha(alpha_failure_deg, h1, beta_deg)
+        eps = 1e-6
+        h_s = clamp(h_s, h1 + eps, H - eps)
+        slices, L2 = build_slices_regimeA(n_slices, H, h1, alpha_failure_deg, beta_deg, h_s,
+                                          gamma_soil=120.0, gamma_lcc=40.0, x_samples_per_slice=360)
+
+    Ma = Pa * h_ps
+    rng = np.random.default_rng(seed)
+    sols: List[Dict[str, float]] = []
+
+    # Deterministic anchors (optional)
+    if use_anchor_starts:
+        fs_seeds  = (fs_bounds[0], 1.0, fs_bounds[1])
+        lam_seeds = (0.15, 0.35, 0.50, 0.70)
+        for FS0 in fs_seeds:
+            for L0 in lam_seeds:
+                if len(sols) >= pop:
+                    break
+                x0 = (FS0, L0, 0.0, 0.0)
+                try:
+                    s = solve_coupled_strict(slices, Pa, Ma, phi_deg, c_base, kh,
+                                             fs_bounds, lam_bounds, dp_pct, x0,
+                                             fd_scheme=fd_scheme, scale_residuals=scale_residuals,
+                                             tol_abs=tol_abs, tol_rel=tol_rel, xtol_rel=xtol_rel)
+                    s['x0'] = x0
+                    sols.append(s)
+                except Exception:
+                    pass
+
+    # Random starts (fill remaining slots)
+    while len(sols) < pop:
+        FS0  = rng.uniform(fs_bounds[0], fs_bounds[1])
+        lam0 = rng.uniform(lam_bounds[0], lam_bounds[1])
+        E0_0 = rng.uniform(-1000.0, 1000.0)  # modest range; enlarge if needed
+        dP_s0 = rng.uniform(-dp_pct*abs(Pa)/1000.0, dp_pct*abs(Pa)/1000.0)
+        x0 = (FS0, lam0, E0_0, dP_s0)
+        try:
+            s = solve_coupled_strict(slices, Pa, Ma, phi_deg, c_base, kh,
+                                     fs_bounds, lam_bounds, dp_pct, x0,
+                                     fd_scheme=fd_scheme, scale_residuals=scale_residuals,
+                                     tol_abs=tol_abs, tol_rel=tol_rel, xtol_rel=xtol_rel)
+            s['x0'] = x0
+            sols.append(s)
+        except Exception:
+            pass
+
+    # Filter valid solutions (strictly within bounds; solver already clamps)
+    valid = [
+        s for s in sols
+        if (fs_bounds[0] - 1e-9) <= s['FS'] <= (fs_bounds[1] + 1e-9)
+        and (lam_bounds[0] - 1e-12) <= s['lam'] <= (lam_bounds[1] + 1e-12)
+        and abs(s['dP']) <= dp_pct * abs(Pa) + 1e-6
+    ]
+    if not valid:
+        return regime, acrit_deg, L2 if regime == "A" else None, None, None, 0
+
+    # Report: (1) closest FS to 1.0 (tie: smaller |dP|), (2) min |dP|
+    minFS = min(valid, key=lambda s: (abs(s['FS'] - 1.0), abs(s['dP'])))
+    minDP = min(valid, key=lambda s: abs(s['dP']))
+    return regime, acrit_deg, L2 if regime == "A" else None, minFS, minDP, len(valid)
+
+# -----------------------
+# Practical 0.1-ft sweep
+# -----------------------
+def sweep_hps_practical_0p1ft(
+    Pa: float,
+    phi_deg: float,
+    c_base: float,
+    kh: float,
+    H: float,
+    h1: float,
+    beta_deg: float,
+    n_slices: int,
+    alpha_failure_deg: float,
+    hps_lo: float,
+    hps_hi: float,
+    # Tight regime:
+    fs_bounds=(0.95, 1.05),
+    lam_bounds=(LAMBDA_MIN, 0.8),
+    dp_pct: float = 0.05,
+    # Solver/GRG-like:
+    fd_scheme: str = "central",
+    scale_residuals: bool = False,
+    tol_abs=(1e-12, 1e-9, 1e-12),
+    tol_rel=(1e-8,  1e-8, 1e-8),
+    xtol_rel: float = 1e-8,
+    pop: int = 10,
+    seed: int = 3,
+    use_anchor_starts: bool = False,
+    prior_hps: Optional[float] = None,   # optional tie-break helper
+) -> Tuple[Optional[Tuple[float, Dict[str, float]]], List[Tuple[float, Optional[Dict[str, float]]]]]:
+    """
+    Sweep h_ps at 0.1 ft increments; return practical best and rows.
+    Best criterion: min |FS-1| (tie: smaller |dP|; then closest to prior_hps if provided).
+    """
+    points = [round(hps_lo + 0.1*i, 1) for i in range(int(round((hps_hi - hps_lo) / 0.1)) + 1)]
+    rows: List[Tuple[float, Optional[Dict[str, float]]]] = []
+    candidates: List[Tuple[float, Dict[str, float]]] = []
+
+    for hps in points:
+        regime, acrit, L2, minFS, minDP, count = run_auto_regime_strict(
+            Pa, hps, phi_deg, c_base, kh, H, h1, beta_deg, n_slices, alpha_failure_deg,
+            fs_bounds=fs_bounds, lam_bounds=lam_bounds, dp_pct=dp_pct,
+            fd_scheme=fd_scheme, scale_residuals=scale_residuals,
+            tol_abs=tol_abs, tol_rel=tol_rel, xtol_rel=xtol_rel,
+            pop=pop, seed=seed, use_anchor_starts=use_anchor_starts
+        )
+        rows.append((hps, minFS))
+        if minFS is not None:
+            candidates.append((hps, minFS))
+
+    if not candidates:
+        return None, rows
+
+    # Sort by |FS-1|, then |dP|, then proximity to prior_hps (if provided)
+    def key_fn(item):
+        hps, sol = item
+        base = (abs(sol['FS'] - 1.0), abs(sol['dP']))
+        if prior_hps is None:
+            return base
+        return (base[0], base[1], abs(hps - prior_hps))
+
+    candidates_sorted = sorted(candidates, key=key_fn)
+    best = candidates_sorted[0]
+    return best, rows
+
+# -----------------------
+# Excel-like profile helper (optional)
+# -----------------------
+def excel_like_tolerances():
+    # Excel GRG-like precision; use with scale_residuals=True for best effect.
+    return ( (1e-7, 1e-7, 1e-7), (1e-7, 1e-7, 1e-7), 1e-7 )
+
+# -----------------------
+# Example (main)
+# -----------------------
+if __name__ == "__main__":
+    # COMMON inputs
+    Pa   = 14384.0     # lb/ft
+    phi_deg = 34.0     # deg
+    c_base  = 0.0      # psf
+    kh      = 0.16
+    H       = 38.0     # ft
+    h1      = 3.0      # ft
+    beta_deg = 45.0    # deg
+    n_slices = 3
+    alpha_failure_deg = 39.853  # deg
+
+    # Tight regime
+    fs_bounds = (0.95, 1.05)
+    lam_bounds= (LAMBDA_MIN, 0.8)
+    dp_pct    = 0.05   # ±5%*Pa
+
+    # Excel-like posture
+    fd_scheme = "central"      # CENTRAL derivatives (Excel)
+    scale_res = False          # Set True if you use "Automatic Scaling" behavior
+    pop = 10                   # MultiStart pop
+    seed = 3                   # RNG seed for reproducibility
+    use_anchors = False        # Deterministic anchors for added coverage (optional)
+    tol_abs, tol_rel, xtol_rel = excel_like_tolerances()  # Or comment out to use tighter defaults
+
+    # Practical 0.1-ft sweep
+    hps_lo, hps_hi = 18.0, 19.0
+    best, rows = sweep_hps_practical_0p1ft(
+        Pa, phi_deg, c_base, kh, H, h1, beta_deg, n_slices, alpha_failure_deg,
+        hps_lo, hps_hi,
+        fs_bounds=fs_bounds, lam_bounds=lam_bounds, dp_pct=dp_pct,
+        fd_scheme=fd_scheme, scale_residuals=scale_res,
+        tol_abs=tol_abs, tol_rel=tol_rel, xtol_rel=xtol_rel,
+        pop=pop, seed=seed, use_anchor_starts=use_anchors,
+        prior_hps=None  # or set to Seed & Whitman / V08R prior to bias tie-break
+    )
+
+    print("h_ps  FS        lambda     dP(lb/ft)  iters")
+    for hps, sol in rows:
+        if sol is None:
+            print(f"{hps:4.1f}  REJECT")
+        else:
+            print(f"{hps:4.1f}  {sol['FS']:8.6f}  {sol['lam']:+8.6f}  {sol['dP']:+9.3f}  {sol['iters']:5d}")
+
+    if best is None:
+        print("\nBest practical (0.1 ft): None")
+    else:
+        hps_star, sol = best
+        print(f"\nBest practical (0.1 ft): h_ps={hps_star:.1f}  "
+              f"FS={sol['FS']:.6f}, lambda={sol['lam']:+.6f}, dP={sol['dP']:+.3f} lb/ft, iters={sol['iters']}")
