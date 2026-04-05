@@ -1,0 +1,582 @@
+\documentclass[Journal,letterpaper]{ascelike-new}
+
+% ===================== Packages =====================
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage[figurename=Fig.,labelfont=bf,labelsep=period]{caption}
+\usepackage[colorlinks=true,citecolor=blue,linkcolor=black,urlcolor=blue]{hyperref}
+\usepackage{booktabs}
+\usepackage{siunitx}
+\usepackage{enumitem}
+
+\NameTag{Adib, \today}
+
+% ===================== Macros =====================
+\newcommand{\diff}{\mathrm{d}}
+\newcommand{\kh}{k_h}
+
+\begin{document}
+
+\title{SOKOLOVSKII STRESS FIELD AND CONSTANT-\texorpdfstring{$\lambda$}{lambda} GLE CLOSURE: COMPLETE DERIVATION FOR PSEUDO-STATIC ACTIVE EARTH PRESSURE}
+
+\author[1]{Mazen Adib, Ph.D., P.E., M.ASCE}
+\affil[1]{Principal Engineer. Email: \href{mailto:email@domain.com}{email@domain.com}}
+
+\maketitle
+
+\begin{abstract}
+A formulation is presented that establishes consistency between stress-field solutions based on the method of characteristics and generalized limit equilibrium (GLE) procedures for the evaluation of pseudo-static active earth pressure on a smooth vertical wall. Seismic loading is incorporated through rotation of the gravity field following Cheng~\cite{Cheng2003}, which induces a transition zone adjacent to the wall. For cohesionless soils, the resulting stress field exhibits self-similarity, leading to a linear pressure distribution and a resultant acting at approximately one-third of the wall height. Extension to cohesive–frictional materials indicates that, while cohesion modifies the magnitude of the thrust, the overall distribution remains close to linear under seismic loading. By enforcing equivalence of global force and moment, a constant interslice force inclination parameter $\lambda$ may be identified within a GLE framework. The vertical stress amplification at the wall predicted by the stress-field solution is independently corroborated by the dynamic rocking mechanism of Madabhushi and Westcott~\cite{Madabhushi2024}. Slide2 verification confirms $FS=1.000$ at the predicted $\lambda$ for $c’=0$, 100, and 200~psf, with $\lambda$ varying by less than $1^\circ$ over this range.
+\end{abstract}
+
+\section{Introduction}
+Evaluation of seismic earth pressures on retaining structures is commonly performed using limit equilibrium approaches derived from pseudo-static assumptions. Among these, formulations based on Coulomb-type wedges and their extensions~\cite{morgensternPrice1965} remain widely used in practice. In parallel, stress-field solutions derived from plasticity theory~\cite{sokolovskii1965} offer a rigorous description of the stress state but are less frequently applied in routine design.
+
+Despite their common objective, these approaches are typically developed independently. The relationship between stress-field solutions and generalized limit equilibrium (GLE) formulations—particularly with respect to the selection of interslice force inclination—has not been explicitly established. This technical note presents a complete derivation that links Sokolovskii stress-field solutions to generalized limit equilibrium procedures for pseudo-static active earth pressure on a smooth vertical wall with horizontal backfill. The resulting practical two-step procedure allows direct determination of the equivalent constant interslice force inclination~$\lambda$ while reproducing the resultant location obtained from the stress field. All equations, tables, and verification results are provided herein.
+
+\section{Problem statement}
+This study considers a semi-infinite, weightful soil mass behind a smooth vertical wall with horizontal backfill surface and pseudo-static seismic loading. Given $\varphi’$ (friction angle), $c’$ (cohesion), $\gamma$ (unit weight), $\kh$ (horizontal seismic coefficient), $H$ (wall height), and $\delta_{\text{wall}}=0$ (smooth wall), the objective is to determine the wall pressure distribution $p(z)$, the total thrust $P_{AE}$, the resultant location $h$, and the equivalent GLE interslice force inclination $\lambda$.
+
+\section{Governing equations}
+\subsection{Equilibrium (2D, pseudo-static body forces)}
+At every point $(x,z)$ in the soil mass,
+\begin{align}
+\frac{\partial \sigma_x}{\partial x} + \frac{\partial \tau_{xz}}{\partial z} &= \kh,\gamma, \label{eq:1a}\
+\frac{\partial \tau_{xz}}{\partial x} + \frac{\partial \sigma_z}{\partial z} &= \gamma, \label{eq:1b}
+\end{align}
+where $z$ is depth below the surface (positive downward) and $x$ is horizontal distance from the wall (positive into the backfill).
+
+\subsection{Mohr–Coulomb yield condition}
+At every point in the active zone, the stress state lies on the Mohr–Coulomb failure envelope,
+\begin{equation}
+R = \tilde{\sigma},\sin\varphi’, \label{eq:2}
+\end{equation}
+where
+\begin{equation}
+\sigma_{\text{mean}}=\frac{\sigma_1+\sigma_3}{2},\qquad
+R=\frac{\sigma_1-\sigma_3}{2},\qquad
+\tilde{\sigma}=\sigma_{\text{mean}}+c’\cot\varphi’.
+\end{equation}
+
+\subsection{Stress components in Cartesian coordinates}
+The stress tensor at any point is expressed in terms of $\tilde{\sigma}$ and the principal stress rotation angle $\psi$ (angle of $\sigma_1$ from vertical, measured counter-clockwise):
+\begin{align}
+\sigma_x &= \sigma_{\text{mean}} - R\cos(2\psi), \label{eq:3a}\
+\sigma_z &= \sigma_{\text{mean}} + R\cos(2\psi), \label{eq:3b}\
+\tau_{xz} &= -R\sin(2\psi). \label{eq:3c}
+\end{align}
+Substituting Eq.~\eqref{eq:2} and $\sigma_{\text{mean}}=\tilde{\sigma}-c’\cot\varphi’$ gives
+\begin{align}
+\sigma_x &= \tilde{\sigma}\bigl[1-\sin\varphi’\cos(2\psi)\bigr]-c’\cot\varphi’, \label{eq:3ap}\
+\sigma_z &= \tilde{\sigma}\bigl[1+\sin\varphi’\cos(2\psi)\bigr]-c’\cot\varphi’, \label{eq:3bp}\
+\tau_{xz} &= -\tilde{\sigma}\sin\varphi’\sin(2\psi). \label{eq:3cp}
+\end{align}
+
+\section{Rankine zone (far from wall)}
+\subsection{Cohesionless backfill ($c’=0$)}
+Far from the wall, the stress field is self-similar: all stresses scale linearly with depth $z$. This follows from the absence of a length scale when $c’=0$. Let
+\begin{equation}
+\sigma_{\text{mean}}=s\gamma z,
+\end{equation}
+where $s$ is dimensionless. In the self-similar field, $\partial(\cdot)/\partial x=0$, and Eq.~\eqref{eq:1b} gives
+\begin{equation}
+\sigma_z=\gamma z. \label{eq:4}
+\end{equation}
+Equation~\eqref{eq:1a} gives
+\begin{equation}
+\tau_{xz}=\kh\gamma z. \label{eq:5}
+\end{equation}
+Substituting Eqs.~\eqref{eq:4}–\eqref{eq:5} into Eqs.~\eqref{eq:3b}–\eqref{eq:3c} with $R=s\gamma z\sin\varphi’$ yields
+\begin{align}
+s+s\sin\varphi’\cos(2\psi) &= 1, \label{eq:6}\
+-s\sin\varphi’\sin(2\psi) &= \kh. \label{eq:7}
+\end{align}
+Eliminating $\psi$ by squaring and adding gives
+\begin{equation}
+(1-s)^2+\kh^2=s^2\sin^2\varphi’\quad\Rightarrow\quad s^2\cos^2\varphi’ -2s+(1+\kh^2)=0. \label{eq:8}
+\end{equation}
+The active root corresponds to the smaller $s$:
+\begin{equation}
+s = \frac{2-\sqrt{4-4\cos^2\varphi’(1+\kh^2)}}{2\cos^2\varphi’}. \label{eq:9}
+\end{equation}
+Define
+\begin{align}
+K_x &\equiv \frac{\sigma_x}{\sigma_z}=2s-1, \label{eq:10}\
+\lambda_{\text{Rankine}} &\equiv \frac{\tau_{xz}}{\sigma_x}=\frac{\kh}{2s-1}=\frac{\kh}{K_x}, \label{eq:11}\
+\psi_R &= \tfrac{1}{2},\operatorname{atan2}(-2\kh,,1-K_x). \label{eq:12}
+\end{align}
+
+\subsection{Cohesive–frictional backfill ($c’>0$)}
+For $c’>0$, the problem is not self-similar because the dimensionless cohesion ratio
+\begin{equation}
+m=\frac{c’}{\gamma z}
+\end{equation}
+depends on depth. At each depth, the quadratic for $s$ becomes
+\begin{equation}
+A s^2 + B s + C = 0, \label{eq:13}
+\end{equation}
+with
+\begin{equation}
+A=\cos^2\varphi’,\qquad B=-2\bigl(1+m\sin\varphi’\cos\varphi’\bigr),\qquad C=1+\kh^2-m^2\cos^2\varphi’.
+\end{equation}
+The active root is
+\begin{equation}
+s(z)=\frac{-B-\sqrt{B^2-4AC}}{2A}. \label{eq:14}
+\end{equation}
+When $B^2-4AC<0$, no active state exists at that depth (tension zone). The critical depth $z_{cr}$ where the discriminant vanishes defines the tension crack depth.
+
+Depth-varying quantities are
+\begin{equation}
+K_x(z)=2s(z)-1, \label{eq:15}
+\end{equation}
+and $\psi_R(z)$ follows from the stress-tensor inversion using Eqs.~\eqref{eq:3a}–\eqref{eq:3c}:
+\begin{align}
+\cos(2\psi_R) &= \frac{\sigma_z-\sigma_{x,R}}{2R},\qquad
+\sin(2\psi_R) = -\frac{\tau_{xz}}{R}, \label{eq:16}
+\end{align}
+with $\sigma_{x,R}=(2s(z)-1)\gamma z$, $\sigma_z=\gamma z$, $\tau_{xz}=\kh\gamma z$, and $R=\tilde{\sigma}(z)\sin\varphi’$.
+
+\section{Fan zone}
+Seismic loading is introduced through a rotation of the gravity vector by an angle $\varepsilon=\arctan\kh$ following the approach of Cheng~\cite{Cheng2003}. This transformation permits the governing equations to retain their static form while incorporating inertial effects. The modified body force is $\gamma’=\gamma\sqrt{1+\kh^2}$.
+
+For a smooth vertical wall under static loading ($\kh=0$), there is no fan zone: the entire domain is a Rankine zone with parallel straight slip lines, and the Coulomb solution is exact (Sokolovskii~\cite{sokolovskii1965}, Chapter~11 and Chapter~25). Under pseudo-static seismic loading, the smooth vertical wall becomes an inclined surface in the rotated coordinate system. This inclination creates a transition (fan) zone between the Rankine zone and the wall in which stress characteristics rotate to satisfy boundary conditions. This feature arises naturally from the rotated stress state and differs from the classical static solution.
+
+For cohesionless materials, the absence of an intrinsic stress scale leads to a self-similar solution in which stresses vary linearly with depth. The corresponding lateral pressure distribution is therefore linear, and the resultant force acts at approximately one-third of the wall height.
+
+Between the Rankine zone and the wall, the stress field transitions through the fan zone where $\psi$ changes from $\psi_R$ to the wall value. Along a characteristic (slip line) for $c’=0$,
+\begin{equation}
+\frac{\diff \tilde{\sigma}}{\tilde{\sigma}} = 2\sin\varphi’,\diff\psi. \label{eq:17}
+\end{equation}
+Integrating from the Rankine boundary to an arbitrary point yields
+\begin{equation}
+\tilde{\sigma}(\psi)=\tilde{\sigma}*R\exp\bigl[2\sin\varphi’(\psi-\psi_R)\bigr]. \label{eq:18}
+\end{equation}
+Note that the sign convention adopted here ($\psi$ counter-clockwise from vertical) gives $\psi_R<0$ for $\kh>0$, and $\psi$ increases from $\psi_R$ to $\psi*{\text{wall}}=0$ toward the wall. Eq.~\eqref{eq:18} therefore implies $\tilde{\sigma}$ increases toward the wall (fan-zone amplification). Define the amplification factor
+\begin{equation}
+A_{\text{fan}}=\exp\bigl(-2\sin\varphi’,\psi_R\bigr), \label{eq:19}
+\end{equation}
+which is greater than unity because $\psi_R<0$. Then
+\begin{equation}
+\tilde{\sigma}_{\text{wall}}=\tilde{\sigma}*R,A*{\text{fan}}. \label{eq:20}
+\end{equation}
+
+\section{Wall boundary conditions (smooth wall)}
+At the smooth wall face ($x=0$),
+\begin{equation}
+\tau_{xz,\text{wall}}=0. \label{eq:21a}
+\end{equation}
+From Eq.~\eqref{eq:3c}, $R\sin(2\psi_{\text{wall}})=0$ and $R>0$ in the active zone, hence
+\begin{equation}
+\psi_{\text{wall}}=0. \label{eq:21b}
+\end{equation}
+At the wall, $\sigma_1$ is vertical and $\sigma_3$ is horizontal.
+
+\section{Wall stresses and pressure}
+\subsection{Cohesionless backfill ($c’=0$)}
+At the wall with $\psi_{\text{wall}}=0$,
+\begin{equation}
+\tilde{\sigma}*{\text{wall}}=s\gamma z,A*{\text{fan}}. \label{eq:22}
+\end{equation}
+The wall stresses are
+\begin{align}
+\sigma_{x,\text{wall}} &= \tilde{\sigma}*{\text{wall}}(1-\sin\varphi’), \label{eq:23}\
+\sigma*{z,\text{wall}} &= \tilde{\sigma}*{\text{wall}}(1+\sin\varphi’). \label{eq:24}
+\end{align}
+Define the wall pressure coefficient
+\begin{equation}
+K*{\text{wall}}=s,A_{\text{fan}},(1-\sin\varphi’). \label{eq:25}
+\end{equation}
+The vertical stress ratio at the wall is
+\begin{equation}
+\frac{\sigma_{z,\text{wall}}}{\gamma z}=s,A_{\text{fan}},(1+\sin\varphi’). \label{eq:26}
+\end{equation}
+The wall pressure distribution is linear:
+\begin{equation}
+p(z)=K_{\text{wall}}\gamma z. \label{eq:27}
+\end{equation}
+Therefore, the pressure distribution is triangular and the resultant location is exact:
+\begin{equation}
+h=\frac{H}{3}. \label{eq:hH3}
+\end{equation}
+
+\subsection{Key observation: vertical stress amplification at the wall}
+From Eq.~\eqref{eq:26}, the vertical stress at the wall is not geostatic. The fan zone amplification creates additional vertical stress:
+\begin{equation}
+\frac{\sigma_{z,\text{wall}}}{\sigma_{z,\text{geostatic}}}=s,A_{\text{fan}},(1+\sin\varphi’). \label{eq:28}
+\end{equation}
+Example ($\varphi’=34^\circ$, $\kh=0.16$): $s=0.6646$, $\psi_R=-12.75^\circ$, $A_{\text{fan}}=1.283$, and $\sigma_{z,\text{wall}}/(\gamma z)=1.329$.
+
+\subsection{Numerical verification: $K_{\text{wall}}\approx K_{AE}$ (Mononobe–Okabe) for $c’=0$}
+For $c’=0$, smooth wall, and level backfill, the derived coefficient
+\begin{equation}
+K_{\text{wall}}=s,\exp(2\sin\varphi’,\psi_R),(1-\sin\varphi’)
+\end{equation}
+matches the Mononobe–Okabe coefficient $K_{AE}$ for $\delta=0$ (verified numerically; example above gives $K_{\text{wall}}\approx 0.376$ and $K_{AE}\approx 0.378$).
+
+\subsection{Cohesive–frictional backfill ($c’>0$)}
+For $c’>0$, the pressure at each depth $z$ requires a depthwise computation:
+\begin{enumerate}[label=(\alph*),leftmargin=*]
+\item Solve Eq.~\eqref{eq:14} for $s(z)$ with $m=c’/(\gamma z)$.
+\item Compute $\psi_R(z)$ from Eq.~\eqref{eq:16}.
+\item Apply fan zone amplification:
+\begin{equation}
+\tilde{\sigma}*{\text{wall}}(z)=\tilde{\sigma}*R(z)\exp\bigl(2\sin\varphi’,\psi_R(z)\bigr).
+\end{equation}
+\item Compute wall pressure:
+\begin{equation}
+p(z)=\sigma*{x,\text{wall}}(z)=\tilde{\sigma}*{\text{wall}}(z)(1-\sin\varphi’)-c’\cot\varphi’.
+\end{equation}
+\item If $p(z)<0$, set $p(z)=0$ (tension zone).
+\end{enumerate}
+The pressure is no longer linear in $z$: near the surface $p(z)=0$ for $z<z_{cr}$, and at depth the solution approaches the $c’=0$ form. On the Sokolovskii curved slip lines the pressure distribution is nonlinear and the resultant acts at $h<H/3$ with increasing cohesion. However, on the planar failure surface routinely employed in GLE analyses, seismic interslice shear forces restore an approximately linear distribution, yielding $h\approx H/3$ for the verified range of parameters ($c’/\gamma H=0$ to $0.056$, $\kh=0.16$, $\varphi’=34^\circ$). Under static loading ($\kh=0$, $\lambda=0$), $h$ drops with increasing $c’$ (e.g.\ $h/H=0.199$ at $c’=200$~psf).
+
+\section{From Sokolovskii to constant-$\lambda$ GLE closure}
+\subsection{Physical mechanism: vertical stress redistribution}
+The fan zone amplifies vertical stress at the wall (Eq.~\eqref{eq:28}). In the GLE framework, the same redistribution occurs through interslice shear forces $X_i$. Consider slice $i$ in a Morgenstern–Price (M–P) formulation. The vertical force balance gives
+\begin{equation}
+N\cos\alpha + F\sin\alpha = W + E_{i+1}\sin(\delta_{i+1}) - E_i\sin(\delta_i), \label{eq:29}
+\end{equation}
+where $\alpha$ is the base inclination, $W$ is slice weight, $(N,F)$ are base normal and shear, and $E_i$ acts on the left face at inclination $\delta_i$. For the wall-adjacent slice (slice 1) with smooth wall, $\delta_1=0$ and $X_1=0$, so
+\begin{equation}
+V_{\text{base}} = W + X_2, \label{eq:30}
+\end{equation}
+with $X_2=E_2\sin\delta_2>0$ pushing downward on slice 1. The interslice shear from the interior adds vertical load to the wall-adjacent slice, increasing $\sigma_z$ beyond $\gamma z$, which is the direct analogue of the fan-zone amplification.
+
+\subsection{Deterministic two-step procedure for $\lambda$}
+The constant-$\lambda$ value cannot be recovered from a simple average of stress ratios because the GLE moment equation contains nonlinear coupling through the backward march. This study therefore uses two independent steps.
+
+\paragraph{Step 1: Sokolovskii $\rightarrow h$.}
+Compute $p(z)$ as described above and integrate to obtain
+\begin{align}
+P_{AE} &= \int_0^H p(z),\diff z, \label{eq:31}\
+h &= \frac{\int_0^H p(z)(H-z),\diff z}{P_{AE}}. \label{eq:32}
+\end{align}
+For $c’=0$, $h=H/3$ exactly. For $c’>0$ on the Sokolovskii curved slip line, $h<H/3$. On the planar failure surface under seismic loading, $h\approx H/3$ for all $c’$.
+
+\paragraph{Step 2: GLE moment equation $\rightarrow \lambda$.}
+Run the M–P backward march at the critical failure angle $\alpha$ with constant interslice inclination $\delta$ (smooth wall: $\delta_1=0$). All equations are evaluated at $FS=1.0$. The backward-march equations are
+\begin{align}
+A_i &= W_i(\cos\delta_i - \kh\sin\delta_i) - c’ L_i\sin(\alpha-\delta_i), \
+D_i &= \cos(\alpha-\delta_i) + \tan\varphi’\sin(\alpha-\delta_i), \
+N_i &= \frac{A_i - E_{i+1}\sin(\delta_i-\delta_{i+1})}{D_i}, \
+F_i &= N_i\tan\varphi’ + c’ L_i, \
+E_i &= \frac{E_{i+1}\cos\delta_{i+1} + \kh W_i + N_i\sin\alpha - F_i\cos\alpha}{\cos\delta_i}.
+\end{align}
+The moment arm $h$ depends on $\delta$ through the $N_i$ distribution. A binary search on $\delta$ is performed until the GLE-computed $h$ matches the Sokolovskii value from Step~1. The resulting $\delta$ is reported as the constant-$\lambda$ GLE value.
+
+\subsection{Critical failure angle}
+The critical angle $\alpha$ is determined from the GLE backward march at $\lambda=0$ by sweeping $\alpha$ to maximize $P_{AE}$. For $\varphi’=34^\circ$, $c’=0$, $\alpha_{\text{crit}}\approx 54.8^\circ$; for $\varphi’=34^\circ$, $c’=200\ \text{psf}$, $\alpha_{\text{crit}}\approx 55.8^\circ$.
+
+\section{Results}
+\subsection{Cohesionless backfill ($c’=0$): verified}
+For $c’=0$, $h=H/3$ for all $\varphi’$ and $\kh$. Table~\ref{tab:c0} lists the GLE $\lambda$ values at the critical failure angle for $\varphi’=34^\circ$.
+
+\begin{table}[h!]
+\caption{Verified results for $c’=0$ and $\varphi’=34^\circ$ (triangular pressure, $h/H=1/3$).}
+\label{tab:c0}
+\centering
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+$\varphi’$ (deg) & $\kh$ & $\alpha_{\text{crit}}$ (deg) & $\lambda$ (deg) & $\tan\lambda$ & $\lambda/\tan\varphi’$ \
+\midrule
+34 & 0.00 & 62.0 & 0.00 & 0.000 & 0.000 \
+34 & 0.04 & 60.4 & 4.16 & 0.073 & 0.108 \
+34 & 0.08 & 58.6 & 8.49 & 0.149 & 0.221 \
+34 & 0.12 & 56.7 & 12.83 & 0.228 & 0.338 \
+34 & 0.16 & 54.8 & 17.72$^*$ & 0.320 & 0.474 \
+34 & 0.20 & 52.6 & 20.98 & 0.383 & 0.568 \
+34 & 0.24 & 50.4 & 24.49 & 0.456 & 0.675 \
+\bottomrule
+\multicolumn{6}{l}{\footnotesize $^*$Independently verified by Slide2 ($FS=1.000$).}
+\end{tabular}
+\end{table}
+
+\subsection{Cohesive–frictional backfill ($c’>0$)}
+On the Sokolovskii curved slip lines, the pressure is nonlinear and $h<H/3$ with increasing cohesion. Table~\ref{tab:cpos} summarizes these reference results for $\varphi’=34^\circ$. Curved slip-line results are provided for reference and are not used for constant-$\lambda$ closure on the prescribed planar failure surface.
+
+\begin{table}[h!]
+\caption{Sokolovskii stress-field results on curved slip lines ($\varphi’=34^\circ$; reference only, not used for GLE closure).}
+\label{tab:cpos}
+\centering
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+$\kh$ & $c’$ (psf) & $P_{AE}$ (lb/ft) & $h/H$ & $\alpha_{\text{crit}}$ (deg) \
+\midrule
+0.16 & 0   & 20{,}290 & 0.333 & 54.8 \
+0.16 & 50  & 18{,}673 & 0.320 & 55.1 \
+0.16 & 100 & 17{,}128 & 0.306 & 55.3 \
+0.16 & 200 & 14{,}245 & 0.280 & 55.8 \
+\midrule
+0.24 & 0   & 23{,}996 & 0.333 & 50.4 \
+0.24 & 50  & 22{,}282 & 0.321 & 50.9 \
+0.24 & 100 & 20{,}646 & 0.310 & 51.4 \
+0.24 & 200 & 17{,}584 & 0.286 & 52.1 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+On the planar failure surface used in the GLE, the seismic interslice shear restores $h\approx H/3$ for the verified cohesion range. The Slide2 verification table (Table~\ref{tab:slide2}) presents the design-relevant planar-surface results.
+
+\subsection{Wall pressure distribution example for Slide2 verification}
+For all seismic cases ($\kh>0$), the pressure is applied as a triangular distribution from $p=0$ at the crest to $p_{\max}=2P_{AE}/H$ at the base, acting at $h=H/3$. The PAE is computed from the GLE backward march at $\lambda=0$; in the verified cases this value is only weakly sensitive to $\lambda$ on the prescribed planar surface. Table~\ref{tab:slide2} summarizes the Slide2 verification cases for $\varphi’=34^\circ$, $\gamma=120$~pcf, $H=30$~ft.
+
+\begin{table}[h!]
+\caption{Slide2 verification of the two-step lambda procedure.}
+\label{tab:slide2}
+\centering
+\begin{tabular}{@{}lcccccc@{}}
+\toprule
+Case & $c’$ (psf) & $\kh$ & $P_{AE}$ (lb/ft) & $\alpha$ ($^\circ$) & $h/H$ & Slide2 result \
+\midrule
+0 & 0   & 0.16 & 20{,}565 & 54.8 & 0.333 & $FS=1.000$, $\lambda=17.72^\circ$ \
+1 & 100 & 0.16 & 17{,}442 & 55.3 & 0.333 & $FS=1.000$, $\lambda=17.23^\circ$ \
+2 & 200 & 0.16 & 14{,}583 & 55.8 & 0.333 & $FS=1.000$, $\lambda=16.70^\circ$ \
+3 & 200 & 0.00 &  9{,}553 & 62.0 & 0.199 & $FS=1.000$, $\lambda=0^\circ$ \
+\bottomrule
+\end{tabular}
+\end{table}
+
+Case~3 (static, $c’=200$~psf) confirms that without seismic loading, $h$ drops to $0.199H$ and $\lambda=0$. The contrast between Cases~2 and~3 is the central finding: for the same soil ($c’=200$~psf, $\varphi’=34^\circ$), seismic loading ($\kh=0.16$) pushes $h$ from $0.199H$ to $H/3$ and $\lambda$ from $0^\circ$ to $16.7^\circ$. Over the verified range $c’=0$ to $200$~psf ($c’/\gamma H=0$ to $0.056$), $\lambda$ decreases by approximately $1^\circ$ from the $c’=0$ value of $17.72^\circ$.
+
+\section{Comparison and interpretation}
+\subsection{Stress field on the planar failure surface}
+For $\varphi’=34^\circ$ and $\kh=0.16$, the planar failure surface at $\alpha\approx 54.3^\circ$ lies entirely within the fan zone. The Rankine-zone boundary angle from the toe is $\theta_{\max}=40.75^\circ$, while the planar surface subtends $\theta=35.7^\circ$. As a result, the Sokolovskii stress field on the planar surface is not at full yield; the mobilization ratio is $\tau_s/\sigma_n\approx 0.538$ versus $\tan\varphi’\approx 0.675$ (about 80% mobilized). In contrast, the GLE enforces $FS=1.0$ on the prescribed planar surface. The difference is accommodated by the GLE through redistribution of $N$ via $\lambda$, which adjusts $h$ while maintaining overall equilibrium.
+
+\subsection{Why $\lambda_{\text{GLE}}\neq \kh/K_x$}
+The Rankine-zone ratio $\kh/K_x$ is the shear-to-normal ratio on internal vertical planes in the Rankine zone, whereas $\lambda$ is the interslice force inclination that reproduces the wall resultant height for a prescribed planar surface with a smooth wall condition ($\lambda\to 0$ at the wall). The two values differ because (a) the wedge includes both fan and Rankine regions, (b) the wall boundary condition forces zero wall shear, and (c) the M–P force resolution introduces nonlinear coupling.
+
+\subsection{Quantitative verification of $\sigma_z$ redistribution}
+From Eq.~\eqref{eq:28}, the wall vertical stress amplification for $\varphi’=34^\circ$ is summarized in Table~\ref{tab:sigz}.
+
+\begin{table}[h!]
+\caption{Wall vertical stress amplification from the Sokolovskii solution ($\varphi’=34^\circ$).}
+\label{tab:sigz}
+\centering
+\begin{tabular}{@{}ccc@{}}
+\toprule
+$\kh$ & $\sigma_{z,\text{wall}}/(\gamma z)$ & Excess \
+\midrule
+0.00 & 1.000 & 0% \
+0.08 & 1.143 & 14.3% \
+0.16 & 1.329 & 32.9% \
+0.24 & 1.572 & 57.2% \
+\bottomrule
+\end{tabular}
+\end{table}
+
+A corresponding GLE verification for $\kh=0.16$ and $\lambda=0.3195$ (Slide2) gives, for the wall-adjacent slice, $V_{\text{base}}=W+X_2=772+5940=6712\ \text{lb}$, matching $V_{\text{base}}=N\cos\alpha+F\sin\alpha$.
+
+\section{Extension to cohesive–frictional backfill: practical procedure}
+For cohesive–frictional materials under seismic loading, the pressure distribution on a planar failure surface remains close to linear. The following self-contained procedure is recommended:
+\begin{enumerate}[label=\textbf{Step \arabic*:},leftmargin=*]
+\item Compute $P_{AE}$ from the GLE backward march at $\lambda=0$ on the critical planar surface. In the verified cases this value is only weakly sensitive to $\lambda$, and it accounts for cohesion and tension-crack effects.
+\item Adopt $h\approx H/3$ for the point of application.
+\item Select the constant $\lambda$ from the $c’=0$ table (Table~\ref{tab:c0}) corresponding to the design $\kh$ and $\varphi’$. Over the verified range $c’/\gamma H=0$ to $0.056$, $\lambda$ varies by less than $1^\circ$.
+\end{enumerate}
+
+For static loading ($\kh=0$), $\lambda=0$ and $h<H/3$ with increasing $c’$ because no interslice shear is present to redistribute vertical stress.
+
+\textbf{Remark on the Sokolovskii curved slip line.} The Sokolovskii stress field on the curved slip line gives $h/H=0.280$ for $c’=200$~psf ($\varphi’=34^\circ$, $\kh=0.16$), which is below $H/3$. This applies to the curved failure surface, not the planar surface used in the GLE. The superposition structure of Sokolovskii~\cite{sokolovskii1965} (Chapter~25, Part~5) supports this distinction: the weight term $q_2=\gamma r,q_0$ is always linear with depth (self-similar wedge), and only the cohesion/surcharge term introduces a uniform (depth-independent) offset.
+
+\section{Discretization sensitivity}
+Trapezoidal integration of $p(z)$ on the Sokolovskii curved slip line converges rapidly with the number of depth points $n$. Table~\ref{tab:disc_h} summarizes $h/H$ convergence for the Sokolovskii nonlinear pressure distribution (not the planar surface GLE, where $h\approx H/3$ for all $c’$ under seismic loading).
+
+\begin{table}[h!]
+\caption{Convergence of $h/H$ with depth discretization $n$.}
+\label{tab:disc_h}
+\centering
+\begin{tabular}{@{}cccc@{}}
+\toprule
+$n$ & $h/H$ ($c’=0$) & $h/H$ ($c’=200$) & $h/H$ ($c’=400$) \
+\midrule
+50   & 0.3332 & 0.2794 & 0.2258 \
+100  & 0.3333 & 0.2795 & 0.2259 \
+200  & 0.3333 & 0.2795 & 0.2259 \
+500  & 0.3333 & 0.2795 & 0.2259 \
+1000 & 0.3333 & 0.2795 & 0.2259 \
+2000 & 0.3333 & 0.2795 & 0.2259 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+Corresponding $\lambda$ convergence for $c’=200\ \text{psf}$ is shown in Table~\ref{tab:disc_lam}.
+
+\begin{table}[h!]
+\caption{Convergence of $\lambda$ for $c’=200\ \text{psf}$.}
+\label{tab:disc_lam}
+\centering
+\begin{tabular}{@{}cc@{}}
+\toprule
+$n$ & $\lambda$ (deg) \
+\midrule
+100  & 26.62 \
+500  & 26.20 \
+1000 & 26.15 \
+2000 & 26.12 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Tension crack treatment}
+The tension crack depth $z_{cr}$ is defined as the shallowest depth where the Mohr–Coulomb yield condition admits an active state (discriminant of Eq.~\eqref{eq:14} nonnegative). Above $z_{cr}$, no active state exists and $p(z)=0$. The transition is smooth: $p(z_{cr})=0$ and $p(z)$ increases monotonically below $z_{cr}$. Table~\ref{tab:zcr} lists representative crack depths for $\varphi’=34^\circ$, $\gamma=120\ \text{pcf}$, and $H=30\ \text{ft}$.
+
+\begin{table}[h!]
+\caption{Tension crack depth $z_{cr}$ (ft) for $\varphi’=34^\circ$, $\gamma=120\ \text{pcf}$, $H=30\ \text{ft}$.}
+\label{tab:zcr}
+\centering
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+$\kh$ & $c’=50$ & $c’=100$ & $c’=200$ & $c’=400$ \
+\midrule
+0.00 & 1.6 & 3.2 & 6.3 & 12.6 \
+0.08 & 1.4 & 2.8 & 5.5 & 11.1 \
+0.16 & 1.3 & 2.5 & 4.9 & 9.7 \
+0.24 & 1.1 & 2.2 & 4.3 & 8.5 \
+\bottomrule
+\end{tabular}
+\end{table}
+
+In design practice, the tension crack may fill with water, creating hydrostatic pressure in the crack zone; this case is not included here (dry backfill assumed).
+
+\section{Spatially varying $\lambda$}
+The Sokolovskii stress field produces a spatially varying shear ratio: at the wall face $\tau_{xz}/\sigma_x=0$ (smooth wall), the ratio increases through the fan zone, and approaches the Rankine-zone constant $\kh/K_x$ in the interior. The constant-$\lambda$ assumption replaces this spatial variation with a single scalar that produces the same moment arm $h$. A half-sine distribution used in some software approximates this pattern; its area-average ($2/\pi$ times its peak) can be close to the equivalent constant value.
+
+\section{Connection to dynamic vertical stress amplification}
+
+\subsection{Sokolovskii and Madabhushi: independent corroboration}
+The vertical stress amplification at the wall derived in Eq.~\eqref{eq:28} has an independent corroboration in recent experimental and numerical work. Madabhushi and Haigh~\cite{Madabhushi2022} and Madabhushi and Westcott~\cite{Madabhushi2024} demonstrated through dynamic centrifuge tests and finite-element analyses that purely horizontal shaking induces dynamic normal vertical effective stresses via ``rocking’’ of the retained soil body. Their measurements showed increases of up to 100% of geostatic values for dual-row sheet pile walls.
+
+Both frameworks arrive at the same conclusion—$\sigma_z$ at the wall exceeds $\gamma z$ under horizontal loading—but from independent theoretical bases:
+\begin{itemize}[leftmargin=*]
+\item \textbf{Sokolovskii (plasticity):} The fan-zone stress rotation amplifies $\sigma_z$ by the factor $s,A_{\text{fan}}(1+\sin\varphi’)$, a static equilibrium result from the method of characteristics extended to pseudo-static loading following Cheng~\cite{Cheng2003}.
+\item \textbf{Madabhushi (dynamics):} Horizontal acceleration induces out-of-phase vertical accelerations through rotational inertia (rocking), producing dynamic $\sigma_z$ oscillations.
+\end{itemize}
+
+Both frameworks also agree on the relationship between horizontal and vertical stress at a smooth wall. In the Sokolovskii solution at $\psi_{\text{wall}}=0$,
+\begin{equation}
+\frac{\sigma_{x,\text{wall}}}{\sigma_{z,\text{wall}}} = \frac{1-\sin\varphi’}{1+\sin\varphi’} = K_A\text{ (static Rankine)}.
+\end{equation}
+Madabhushi and Westcott~\cite{Madabhushi2024} reach the same conclusion: the limiting horizontal stress is the static Rankine coefficient applied to the (non-geostatic) dynamic vertical stress, i.e.\ $\sigma’*h = K_A \times \sigma’*{v,\text{dynamic}}$. Dynamic earth pressure coefficients that embed both acceleration and partial mobilization are therefore unnecessary.
+
+\subsection{Resultant location under CAM-DYN rocking}
+Madabhushi and Westcott~\cite{Madabhushi2024} proposed the CAM-DYN analytical method in which the dynamic vertical effective stress at depth $z$ is
+\begin{equation}
+\sigma’_v(z) = \gamma z\bigl[1 \pm \eta(z)\bigr], \qquad \eta(z) = 3,\frac{z}{b},\frac{a(t)}{g},
+\label{eq:camdyn}
+\end{equation}
+where $b$ is the width of the retained soil body and $a(t)$ is the instantaneous horizontal acceleration. The factor~3 arises from vertical and moment equilibrium of a horizontal slice assuming linear stress redistribution across $b$.
+
+The horizontal pressure on a smooth wall is then quadratic in depth:
+\begin{equation}
+p_h(z) = K\gamma z + K\gamma,\frac{3,a(t)}{g,b},z^2 \equiv Az + Bz^2.
+\end{equation}
+
+Integrating for the total force and the moment about the base:
+\begin{align}
+F &= \int_0^H (Az + Bz^2),\diff z = \frac{AH^2}{2} + \frac{BH^3}{3}, \
+M_{\text{base}} &= \int_0^H (Az + Bz^2)(H-z),\diff z = \frac{AH^3}{6} + \frac{BH^4}{12}.
+\end{align}
+
+The resultant location from the base is
+\begin{equation}
+\bar{y} = \frac{M_{\text{base}}}{F} = H,\frac{\tfrac{1}{6}+\tfrac{r}{12}}{\tfrac{1}{2}+\tfrac{r}{3}},
+\qquad r = \pm,3,\frac{H}{b},\frac{a(t)}{g}.
+\label{eq:ybar}
+\end{equation}
+
+When $r=0$ (no rocking), $\bar{y}=H/3$, recovering the classical result. For the over-stressed side ($r>0$), the resultant moves below $H/3$; for the under-stressed side ($r<0$), it moves above.
+
+\subsection{Magnitude of the shift from $H/3$}
+For the prototype geometry of the centrifuge test (Madabhushi and Westcott~\cite{Madabhushi2024}; $H=20$~m, $b=55$~m, $a/g=0.3$), the shift is
+\begin{equation}
+r = 3\times\frac{20}{55}\times 0.3 = 0.327,\qquad \bar{y}/H = 0.318 \quad(\text{over-stressed side}).
+\end{equation}
+
+This is a 4.5% reduction from $H/3$. Table~\ref{tab:rocking} shows the sensitivity to the ratio $H/b$ and $\kh$. For a single retaining wall where $b$ is effectively large ($b\gg H$), the shift is negligible ($<1$–$3%$ for typical $\kh\le 0.24$). The rocking effect on $h$ is significant only for narrow confined soil bodies (dual-row walls with small $b/H$).
+
+\begin{table}[h!]
+\caption{Resultant location $\bar{y}/H$ on the over-stressed side under CAM-DYN rocking.}
+\label{tab:rocking}
+\centering
+\begin{tabular}{@{}cccccc@{}}
+\toprule
+$H$ (m) & $b$ (m) & $\kh$ & $r$ & $\bar{y}/H$ & Shift from $H/3$ \
+\midrule
+20 & 55 & 0.10 & 0.109 & 0.328 & $-1.6%$ \
+20 & 55 & 0.20 & 0.218 & 0.323 & $-3.1%$ \
+20 & 55 & 0.30 & 0.327 & 0.318 & $-4.5%$ \
+\midrule
+10 & 100 & 0.16 & 0.048 & 0.331 & $-0.8%$ \
+10 & 200 & 0.16 & 0.024 & 0.332 & $-0.4%$ \
+30 & 100 & 0.16 & 0.144 & 0.324 & $-2.6%$ \
+\bottomrule
+\end{tabular}
+\end{table}
+
+This result is consistent with the GLE finding that $h\approx H/3$ on a planar failure surface for all values of $c’$ under seismic loading (verified by the GLE solver and Slide2): the rocking-induced shift from $H/3$ is within the numerical precision of the GLE moment balance for typical single-wall geometries.
+
+\section{Illustrative example}
+Consider a smooth vertical wall of height $H=30$~ft (9.14~m) retaining a horizontal backfill with $\gamma=120$~pcf (18.9~kN/m$^3$), $\varphi’=34^\circ$, $c’=200$~psf (9.6~kPa), and $\kh=0.16$.
+\begin{itemize}[leftmargin=*]
+\item The GLE backward march at $\lambda=0$ on the critical surface ($\alpha=55.8^\circ$) yields $P_{AE}=14{,}583$~lb/ft (212.8~kN/m).
+\item The resultant is taken at $h\approx H/3=10.0$~ft (3.05~m).
+\item From Table~\ref{tab:c0}, $\lambda=17.72^\circ$. Slide2 analysis with a triangular pressure distribution ($0$ to $2P_{AE}/H=972$~psf at the base) returns $FS=1.000$ at $\lambda=16.70^\circ$. The $1^\circ$ difference reflects the modest effect of cohesion on $\lambda$.
+\end{itemize}
+
+For comparison, the same soil under static loading ($\kh=0$) gives $P_{AE}=9{,}553$~lb/ft, $h=5.97$~ft ($0.199H$), and $\lambda=0^\circ$.
+
+\section{Key contributions and limitations}
+\subsection{Key contributions}
+\begin{enumerate}[leftmargin=*]
+\item A consistent relationship between stress-field solutions and generalized limit equilibrium procedures has been established for the evaluation of seismic active earth pressure on smooth vertical walls.
+\item For cohesionless soils, the stress field leads to a linear pressure distribution with a resultant acting at approximately one-third of the wall height. Extension to cohesive soils ($c’=0$ to $200$~psf) indicates that this distribution is only moderately affected under seismic loading.
+\item By matching global force and moment, a constant interslice force inclination parameter $\lambda$ can be determined, providing a practical bridge between continuum and limit equilibrium methods. The $c’=0$ lambda table provides a close approximation for cohesive soils, with $\lambda$ varying by less than $1^\circ$ over the verified range.
+\item The vertical stress amplification at the wall ($\sigma_z>\gamma z$) predicted by the fan-zone mechanism is independently corroborated by the dynamic rocking mechanism of Madabhushi and Westcott~\cite{Madabhushi2024}. Both frameworks yield $\sigma_h/\sigma_v=K_A$ (static Rankine) at the smooth wall.
+\end{enumerate}
+
+\subsection{Limitations}
+\begin{enumerate}[leftmargin=*]
+\item The Sokolovskii solution assumes full yield throughout the active zone; for cohesive backfill this may require larger wall movements than occur in service.
+\item The planar failure surface used in the GLE is not identical to the curved slip lines of the stress field; for $c’=0$ this does not affect $h$, while for $c’>0$ under static loading ($\kh=0$) a difference exists ($h<H/3$).
+\item The constant-$\lambda$ assumption is an approximation; the physical interslice shear varies spatially.
+\item The CAM-DYN rocking derivation applies to smooth walls; for rough walls, principal stress rotation at the soil–wall interface must be incorporated (Madabhushi and Westcott~\cite{Madabhushi2024}).
+\end{enumerate}
+
+\section*{Data Availability Statement}
+Data sharing is not applicable to this article as no new data were created or analyzed in this study.
+
+\section*{Acknowledgments}
+(Optional.)
+
+\section*{Notation}
+\begin{description}[leftmargin=*]
+\item[$A_{\text{fan}}$] fan-zone amplification factor, Eq.~\eqref{eq:19}.
+\item[$c’$] effective cohesion.
+\item[$E_i$] interslice resultant on slice face $i$ (GLE).
+\item[$F$] base shear force on a slice (GLE).
+\item[$H$] wall height.
+\item[$h$] resultant height above the wall base, Eq.~\eqref{eq:32}.
+\item[$\kh$] horizontal pseudo-static seismic coefficient.
+\item[$K_x$] Rankine-zone lateral stress ratio on vertical planes, Eq.~\eqref{eq:10}.
+\item[$K_{\text{wall}}$] wall pressure coefficient, Eq.~\eqref{eq:25}.
+\item[$m$] dimensionless cohesion ratio, $m=c’/(\gamma z)$.
+\item[$N$] base normal force on a slice (GLE).
+\item[$p(z)$] wall pressure distribution.
+\item[$P_{AE}$] pseudo-static active thrust, Eq.~\eqref{eq:31}.
+\item[$R$] Mohr-circle radius.
+\item[$s$] dimensionless mean-stress coefficient.
+\item[$\sigma_1,\sigma_3$] major and minor principal stresses.
+\item[$\sigma_{\text{mean}}$] mean principal stress.
+\item[$\sigma_x,\sigma_z,\tau_{xz}$] Cartesian stress components.
+\item[$\tilde{\sigma}$] shifted mean stress, $\tilde{\sigma}=\sigma_{\text{mean}}+c’\cot\varphi’$.
+\item[$\varphi’$] effective friction angle.
+\item[$\psi$] principal stress rotation from vertical.
+\item[$\lambda$] constant GLE interslice force inclination (reported value).
+\end{description}
+
+\bibliographystyle{ascelike-new}
+\bibliography{references}
+
+\end{document}
